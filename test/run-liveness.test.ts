@@ -21,9 +21,9 @@ process.stdin.on('data', (d) => {
     const msg = JSON.parse(line);
     if (typeof msg.id !== 'number') continue; // notification — ignore
     if (msg.method === 'turn/start') {
-      send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      send({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 't_live' } } });
       setInterval(() => {
-        send({ jsonrpc: '2.0', method: 'item/commandExecution/outputDelta', params: { itemId: 'i1', delta: 'x' } });
+        send({ jsonrpc: '2.0', method: 'item/commandExecution/outputDelta', params: { threadId: 'th_live', turnId: 't_live', itemId: 'i1', delta: 'x' } });
       }, 20);
       continue;
     }

@@ -304,34 +304,41 @@ class CodexThread implements AgentThread {
     // The caller owns the new failure mode (card setup throws after the turn
     // started): launchRun aborts+closes the thread on that path.
     //
-    // turn/start stays in flight for the whole turn (events arrive via
-    // notifications), so we can't await it up front. But if it *rejects* —
-    // bad params, thread gone, auth failure — codex emits no notification
-    // that maps to done/error, so the stream loop below would block until the
-    // idle watchdog fires and the user sees a bogus "已超时" instead of the
-    // real cause. Race the rejection against the stream and surface it. (A
-    // clean child exit closes the stream on its own, ending the loop.)
-    let startError: Error | undefined;
-    const startFailed: Promise<'start-failed'> = new Promise((resolve) => {
-      self.client.request('turn/start', params).then(undefined, (err: unknown) => {
-        startError = err instanceof Error ? err : new Error(String(err));
-        log.fail('agent', startError, { phase: 'turn/start' });
-        resolve('start-failed');
-      });
-    });
+    // The RPC response identifies OUR turn. Resume/goal notifications can still
+    // be buffered here; accepting their completion would close the new card.
+    // Observe rejection immediately even when card setup delays consumption.
+    const started = self.client.request<{ turn: { id: string } }>('turn/start', params)
+      .then(
+        (response) => ({ response, error: undefined }),
+        (error: unknown) => ({ response: undefined, error: error instanceof Error ? error : new Error(String(error)) }),
+      );
     async function* gen(): AsyncGenerator<AgentEvent> {
-      const stream = self.client.stream()[Symbol.asyncIterator]();
-      while (true) {
-        const step = await Promise.race([stream.next(), startFailed]);
-        if (step === 'start-failed') {
-          yield { type: 'error', message: startError?.message ?? 'turn/start 请求失败', willRetry: false };
-          return;
+      const result = await started;
+      if (result.error || !result.response?.turn?.id) {
+        const error = result.error ?? new Error('turn/start response is missing turn.id');
+        log.fail('agent', error, { phase: 'turn/start', sessionId: self.sessionId });
+        yield { type: 'error', message: error.message, willRetry: false };
+        return;
+      }
+      const turnId = result.response.turn.id;
+      self.currentTurnId = turnId;
+      log.info('agent', 'turn-bound', { sessionId: self.sessionId, turnId });
+      for await (const notification of self.client.stream()) {
+        const scope = notification.params as { threadId?: string; turnId?: string; turn?: { id: string } };
+        const eventTurnId = scope.turnId ?? scope.turn?.id;
+        if ((scope.threadId && scope.threadId !== self.sessionId) ||
+            (eventTurnId && eventTurnId !== turnId)) {
+          if (notification.method === 'turn/completed' || notification.method === 'turn/started') {
+            log.info('agent', 'turn-event-ignored', {
+              sessionId: self.sessionId, turnId, eventThreadId: scope.threadId,
+              eventTurnId, method: notification.method,
+            });
+          }
+          continue;
         }
-        if (step.done) return;
         lastActivityAt = Date.now();
-        const ev = mapNotification(step.value);
+        const ev = mapNotification(notification);
         if (!ev) continue;
-        if (ev.type === 'turn_started') self.currentTurnId = ev.turnId;
         yield ev;
         if (ev.type === 'done') return;
         if (ev.type === 'error' && !ev.willRetry) return;
