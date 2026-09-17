@@ -9,6 +9,7 @@ import {
   settleOrdinaryTurnRender,
 } from '../src/bot/handle-message';
 import { sendCompletionReminderReply } from '../src/bot/completion-reminder';
+import { CARD_API_TIMEOUT_MS } from '../src/card/run-card-stream';
 import type { AppConfig } from '../src/config/schema';
 
 function dedupe() {
@@ -229,6 +230,30 @@ describe('completion reminder native reply orchestration', () => {
     ).resolves.toBe('skipped');
     expect(reply).toHaveBeenCalledOnce();
     expect(input.outcome).toBe('done');
+  });
+
+  it('does not hang when the fallback reply transport never settles', async () => {
+    vi.useFakeTimers();
+    try {
+      const { channel, reply } = replyChannel(vi.fn(async () => new Promise<never>(() => undefined)));
+      const pending = sendCompletionReminderReply(
+        { channel, cfg: config(), dedupe: dedupe(), now: () => 10_000 },
+        {
+          cardMsgId: 'om_fallback_timeout',
+          requesterOpenId: 'ou_requester',
+          outcome: 'done',
+          requestedAt: 0,
+          manuallyRequested: false,
+          cardUpdated: false,
+          replyInThread: true,
+        },
+      );
+      await vi.advanceTimersByTimeAsync(CARD_API_TIMEOUT_MS);
+      await expect(pending).resolves.toBe('failed');
+      expect(reply).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('only the exact turn initiator qualifies for the manual reminder button action', () => {

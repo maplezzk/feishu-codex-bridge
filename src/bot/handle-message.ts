@@ -4427,6 +4427,7 @@ export function createOrchestrator(
             pushes: st.pushCount,
             cardPushes: st.cardPushes,
             elPushes: st.elPushes,
+            cardTransportBroken: st.transportBroken,
             rttAvg: st.pushCount ? Math.round(st.totalRttMs / st.pushCount) : 0,
             rttMax: st.maxRttMs,
           });

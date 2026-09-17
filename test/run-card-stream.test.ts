@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { RunCardStream } from '../src/card/run-card-stream';
+import { CARD_API_TIMEOUT_MS, RunCardStream } from '../src/card/run-card-stream';
 import { card, mdStream } from '../src/card/cards';
 
 /** A live frame whose only element is the streamed answer ({@link mdStream}). */
@@ -165,6 +165,22 @@ describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
     expect(ch.updates[1].data).toContain('terminal');
     expect(ch.updates[1].data).not.toContain('late repaint');
     expect(ch.updates[1].sequence).toBeGreaterThan(ch.updates[0].sequence);
+  });
+
+  it('does not leave the run waiting forever when a terminal CardKit update hangs', async () => {
+    vi.useFakeTimers();
+    const ch = fakeChannel();
+    const s = new RunCardStream();
+    await s.create(ch, 'oc_terminal_timeout', frame('initial'), {});
+    ch.rawClient.cardkit.v1.card.update = () => new Promise<never>(() => undefined);
+
+    const terminal = s.finalizeCard(ch, frame('terminal'));
+    await vi.advanceTimersByTimeAsync(CARD_API_TIMEOUT_MS);
+
+    await expect(terminal).resolves.toBe(false);
+    // Once a request has timed out, late stream/repaint attempts are dropped so
+    // they cannot queue another write behind the in-flight SDK request.
+    await expect(s.updateCard(ch, frame('late'))).resolves.toBe(false);
   });
 });
 

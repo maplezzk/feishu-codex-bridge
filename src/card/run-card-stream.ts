@@ -35,6 +35,50 @@ const RATE_LIMIT_PENALTY_MS = 1_000;
 /** Terminal-frame retry budget when rate-limited (backoff 1s/2s/4s). */
 const TERMINAL_RL_RETRIES = 3;
 const RL_BACKOFF_BASE_MS = 1_000;
+/** A CardKit request must not hold a run's terminal state forever. The SDK's
+ * transport has no guaranteed request deadline, so the stream adds one at the
+ * last boundary before a card update can block turn cleanup. */
+export const CARD_API_TIMEOUT_MS = 15_000;
+
+class CardApiTimeoutError extends Error {
+  constructor(readonly phase: string) {
+    super(`飞书卡片接口${phase}超时（${CARD_API_TIMEOUT_MS / 1000}s）`);
+    this.name = 'CardApiTimeoutError';
+  }
+}
+
+export function withCardApiTimeout<T>(work: () => Promise<T>, phase: string): Promise<T> {
+  let promise: Promise<T>;
+  try {
+    promise = work();
+  } catch (err) {
+    return Promise.reject(err);
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      reject(new CardApiTimeoutError(phase));
+    }, CARD_API_TIMEOUT_MS);
+    // Attach both handlers immediately. If the request settles after the local
+    // deadline, its result is intentionally ignored and its rejection is still
+    // observed, so a stuck/late SDK promise cannot become an unhandled rejection.
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
 
 class ChatPacer {
   private nextAt = 0;
@@ -117,6 +161,10 @@ export class RunCardStream {
   private lastAnswerText = '';
   // Per-chat pacer shared with the chat's other streams (set in create()).
   private pacer: ChatPacer | null = null;
+  /** A timed-out CardKit request may still be in flight inside the SDK. Stop
+   * issuing more frames after that point; the caller will send the textual
+   * completion/error fallback and the late request cannot keep the run alive. */
+  private transportBroken = false;
   // Forced whole-card writes (button/settings repaint, queue → run flip,
   // terminal frame) must never race one another. In particular, an async
   // completion-reminder repaint that started just before turn completion must
@@ -133,13 +181,21 @@ export class RunCardStream {
   }
 
   /** Push counts (whole-card vs element) + round-trip stats for this card. */
-  stats(): { pushCount: number; cardPushes: number; elPushes: number; totalRttMs: number; maxRttMs: number } {
+  stats(): {
+    pushCount: number;
+    cardPushes: number;
+    elPushes: number;
+    totalRttMs: number;
+    maxRttMs: number;
+    transportBroken: boolean;
+  } {
     return {
       pushCount: this.pushCount,
       cardPushes: this.cardPushes,
       elPushes: this.elPushes,
       totalRttMs: this.totalRttMs,
       maxRttMs: this.maxRttMs,
+      transportBroken: this.transportBroken,
     };
   }
 
@@ -212,12 +268,16 @@ export class RunCardStream {
    * event consumption never blocks on it. Returns true ⇔ the frame landed (the
    * pump only advances its baselines on delivered frames). */
   private async streamElement(channel: LarkChannel, elementId: string, content: string): Promise<boolean> {
-    if (!this.cardId) return false;
+    if (!this.cardId || this.transportBroken) return false;
     const push = (): Promise<unknown> =>
-      channel.rawClient.cardkit.v1.cardElement.content({
-        path: { card_id: this.cardId, element_id: elementId },
-        data: { content, sequence: ++this.seq, uuid: `e_${this.cardId}_${this.seq}` },
-      });
+      withCardApiTimeout(
+        () =>
+          channel.rawClient.cardkit.v1.cardElement.content({
+            path: { card_id: this.cardId, element_id: elementId },
+            data: { content, sequence: ++this.seq, uuid: `e_${this.cardId}_${this.seq}` },
+          }),
+        '内容更新',
+      );
     await this.pacer?.wait();
     const t0 = Date.now();
     try {
@@ -227,14 +287,18 @@ export class RunCardStream {
         const code = cardkitErrCode(err);
         if (code === ERR_STREAMING_OFF) {
           log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, reopenStreaming: true });
-          await channel.rawClient.cardkit.v1.card.settings({
-            path: { card_id: this.cardId },
-            data: {
-              settings: JSON.stringify({ config: { streaming_mode: true } }),
-              sequence: ++this.seq,
-              uuid: `o_${this.cardId}_${this.seq}`,
-            },
-          });
+          await withCardApiTimeout(
+            () =>
+              channel.rawClient.cardkit.v1.card.settings({
+                path: { card_id: this.cardId },
+                data: {
+                  settings: JSON.stringify({ config: { streaming_mode: true } }),
+                  sequence: ++this.seq,
+                  uuid: `o_${this.cardId}_${this.seq}`,
+                },
+              }),
+            '流式设置更新',
+          );
           await push();
         } else if (code === ERR_SEQ_OUT_OF_ORDER) {
           log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, retry: true });
@@ -250,6 +314,8 @@ export class RunCardStream {
       if (rtt > this.maxRttMs) this.maxRttMs = rtt;
       return true;
     } catch (err) {
+      this.markTransportBroken(err, 'run-stream-el');
+      if (this.transportBroken) return false;
       const rl = isRateLimited(err);
       if (rl) this.pacer?.penalize();
       log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, rateLimited: rl });
@@ -276,9 +342,13 @@ export class RunCardStream {
   ): Promise<string> {
     this.pacer = pacerFor(chatId); // shared with the chat's other streams
     const attempt = async (): Promise<string> => {
-      const created = await channel.rawClient.cardkit.v1.card.create({
-        data: { type: 'card_json', data: JSON.stringify(initialCard) },
-      });
+      const created = await withCardApiTimeout(
+        () =>
+          channel.rawClient.cardkit.v1.card.create({
+            data: { type: 'card_json', data: JSON.stringify(initialCard) },
+          }),
+        '创建',
+      );
       const cardId = (created as { data?: { card_id?: string } }).data?.card_id;
       if (!cardId) {
         throw new Error(`cardkit.card.create returned no card_id: ${JSON.stringify(created).slice(0, 200)}`);
@@ -289,16 +359,25 @@ export class RunCardStream {
       const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
       let messageId: string | undefined;
       if (opts.replyTo) {
-        const r = await channel.rawClient.im.v1.message.reply({
-          path: { message_id: opts.replyTo },
-          data: { msg_type: 'interactive', content, reply_in_thread: opts.replyInThread ?? false },
-        });
+        const replyTo = opts.replyTo;
+        const r = await withCardApiTimeout(
+          () =>
+            channel.rawClient.im.v1.message.reply({
+              path: { message_id: replyTo },
+              data: { msg_type: 'interactive', content, reply_in_thread: opts.replyInThread ?? false },
+            }),
+          '发送',
+        );
         messageId = (r as { data?: { message_id?: string } }).data?.message_id;
       } else {
-        const r = await channel.rawClient.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: { receive_id: chatId, msg_type: 'interactive', content },
-        });
+        const r = await withCardApiTimeout(
+          () =>
+            channel.rawClient.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: { receive_id: chatId, msg_type: 'interactive', content },
+            }),
+          '发送',
+        );
         messageId = (r as { data?: { message_id?: string } }).data?.message_id;
       }
       if (!messageId) throw new Error('run card send returned no message_id');
@@ -323,7 +402,7 @@ export class RunCardStream {
    * failed push leaves `lastContent` untouched so the same frame isn't deduped
    * away when it comes around again. */
   async streamCard(channel: LarkChannel, fullCard: CardObject, force = false): Promise<boolean> {
-    if (!this.cardId) return false;
+    if (!this.cardId || this.transportBroken) return false;
     const data = JSON.stringify(fullCard);
     if (data === this.lastContent) return true;
     const now = Date.now();
@@ -332,10 +411,14 @@ export class RunCardStream {
     await this.pacer?.wait();
     const t0 = Date.now();
     try {
-      await channel.rawClient.cardkit.v1.card.update({
-        path: { card_id: this.cardId },
-        data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
-      });
+      await withCardApiTimeout(
+        () =>
+          channel.rawClient.cardkit.v1.card.update({
+            path: { card_id: this.cardId },
+            data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
+          }),
+        '流式更新',
+      );
       this.lastContent = data;
       const rtt = Date.now() - t0;
       this.pushCount++;
@@ -344,6 +427,8 @@ export class RunCardStream {
       if (rtt > this.maxRttMs) this.maxRttMs = rtt;
       return true;
     } catch (err) {
+      this.markTransportBroken(err, 'run-stream');
+      if (this.transportBroken) return false;
       const rl = isRateLimited(err);
       if (rl) this.pacer?.penalize();
       log.fail('card', err, { phase: 'run-stream', cardId: this.cardId, seq: this.seq, rateLimited: rl });
@@ -407,20 +492,27 @@ export class RunCardStream {
   }
 
   private async pushForcedUpdate(channel: LarkChannel, data: string): Promise<boolean> {
-    if (!this.cardId) return false;
+    if (!this.cardId || this.transportBroken) return false;
     const push = async (): Promise<void> => {
-      await channel.rawClient.cardkit.v1.card.update({
-        path: { card_id: this.cardId },
-        data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `u_${this.cardId}_${this.seq}` },
-      });
+      await withCardApiTimeout(
+        () =>
+          channel.rawClient.cardkit.v1.card.update({
+            path: { card_id: this.cardId },
+            data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `u_${this.cardId}_${this.seq}` },
+          }),
+        '终态更新',
+      );
       this.lastContent = data;
     };
     for (let i = 0; ; i++) {
+      if (this.transportBroken) return false;
       await this.pacer?.wait();
       try {
         await push();
         return true;
       } catch (err) {
+        this.markTransportBroken(err, 'run-update');
+        if (this.transportBroken) return false;
         const rl = isRateLimited(err);
         if (rl) this.pacer?.penalize();
         if (i >= (rl ? TERMINAL_RL_RETRIES : 1)) {
@@ -431,6 +523,19 @@ export class RunCardStream {
         await new Promise((r) => setTimeout(r, rl ? RL_BACKOFF_BASE_MS * 2 ** i : 3200));
       }
     }
+  }
+
+  private markTransportBroken(err: unknown, phase: string): void {
+    if (!(err instanceof CardApiTimeoutError)) return;
+    this.transportBroken = true;
+    this.pending = null;
+    log.warn('card', 'transport-timeout', {
+      phase,
+      cardId: this.cardId,
+      seq: this.seq,
+      timeoutMs: CARD_API_TIMEOUT_MS,
+      message: err.message,
+    });
   }
 }
 
