@@ -1,5 +1,7 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
+import { fetchInteractiveCardContent, isLikelyIncompleteCardText } from './card-content';
+import { appendIncompleteContentNotice } from './inbound-content';
 
 /**
  * Inbound CONTEXT weaving — give codex the上下文 a Feishu @ alone doesn't carry.
@@ -55,17 +57,202 @@ export interface ContextMessage {
   fromUser: boolean;
   /** create_time as epoch ms (0 when unknown). */
   createTime: number;
+  /** Internal bridge status line; included even though it is not a user message. */
+  bridgeNotice?: boolean;
 }
 
 /** Subset of the `im.v1.message.get` / `.list` item shape we read. */
 interface RawMsgItem {
   message_id?: string;
   msg_type?: string;
-  create_time?: string;
+  create_time?: string | number;
+  upper_message_id?: string;
   deleted?: boolean;
   sender?: { id?: string; sender_type?: string; sender_name?: string };
   body?: { content?: string };
   mentions?: { key?: string; name?: string }[];
+}
+
+export type ForwardedMessageReadReason = 'fetch-failed' | 'empty-response' | 'empty-content' | 'truncated' | 'unreadable-child';
+
+export interface ForwardedMessageContent {
+  text?: string;
+  complete: boolean;
+  reason?: ForwardedMessageReadReason;
+  /** Number of descendant records returned by Feishu (after the 50-item cap). */
+  itemCount: number;
+  /** Descendants that were attachments, deleted, malformed, or otherwise unreadable. */
+  unreadableCount: number;
+  truncated: boolean;
+}
+
+const FORWARDED_MAX_ITEMS = 50;
+
+/**
+ * Read a merge-forward message as the flat list returned by
+ * `im.v1.message.get`, then rebuild its parent/child tree locally.  Feishu's
+ * SDK does the same for direct inbound events, but quote/topic context used to
+ * collapse the whole record to `[合并转发消息]`.  Keeping this function here
+ * lets all three entry paths (direct, quote, history) share one expansion.
+ */
+export async function fetchForwardedMessageContent(
+  channel: LarkChannel,
+  messageId: string,
+): Promise<ForwardedMessageContent> {
+  let items: RawMsgItem[];
+  try {
+    const res = await channel.rawClient.im.v1.message.get({ path: { message_id: messageId } });
+    items = ((res.data as { items?: RawMsgItem[] } | undefined)?.items ?? []).filter(Boolean);
+  } catch (err) {
+    log.warn('intake', 'forwarded-content-fetch-failed', { messageId, err: String(err) });
+    return { complete: false, reason: 'fetch-failed', itemCount: 0, unreadableCount: 0, truncated: false };
+  }
+  if (items.length === 0) {
+    return { complete: false, reason: 'empty-response', itemCount: 0, unreadableCount: 0, truncated: false };
+  }
+
+  const capped = items.slice(0, FORWARDED_MAX_ITEMS);
+  const truncated = items.length > FORWARDED_MAX_ITEMS;
+  const children = buildForwardChildren(capped, messageId);
+  const state = { unreadableCount: 0, renderedIds: new Set<string>() };
+  const blocks = await renderForwardTree(messageId, children, channel, state, new Set<string>());
+  const itemCount = [...children.values()].reduce((n, list) => n + list.length, 0);
+  const renderedCount = [...state.renderedIds].length;
+  if (renderedCount < itemCount) state.unreadableCount += itemCount - renderedCount;
+  if (blocks.length === 0) {
+    return {
+      complete: false,
+      reason: 'empty-content',
+      itemCount,
+      unreadableCount: state.unreadableCount,
+      truncated,
+    };
+  }
+
+  const footer = truncated ? '\n...（转发记录超过 50 条，后面的消息没有读取）' : '';
+  const text = `<forwarded_messages>\n${blocks.join('\n')}${footer}\n</forwarded_messages>`;
+  return {
+    text,
+    complete: !truncated && state.unreadableCount === 0,
+    reason: truncated ? 'truncated' : state.unreadableCount > 0 ? 'unreadable-child' : undefined,
+    itemCount,
+    unreadableCount: state.unreadableCount,
+    truncated,
+  };
+}
+
+function buildForwardChildren(items: RawMsgItem[], rootId: string): Map<string, RawMsgItem[]> {
+  const map = new Map<string, RawMsgItem[]>();
+  for (const item of items) {
+    const itemId = item.message_id;
+    // The parent itself is returned first and has no upper_message_id.  A
+    // nested item with the same id is retained only when it explicitly names a
+    // parent, which is the same rule as the SDK converter.
+    if (itemId === rootId && !item.upper_message_id) continue;
+    const parentId = item.upper_message_id || rootId;
+    const list = map.get(parentId) ?? [];
+    list.push(item);
+    map.set(parentId, list);
+  }
+  for (const list of map.values()) {
+    list.sort((a, b) => (Number(a.create_time) || 0) - (Number(b.create_time) || 0));
+  }
+  return map;
+}
+
+async function renderForwardTree(
+  parentId: string,
+  children: Map<string, RawMsgItem[]>,
+  channel: LarkChannel,
+  state: { unreadableCount: number; renderedIds: Set<string> },
+  ancestors: Set<string>,
+): Promise<string[]> {
+  if (ancestors.has(parentId)) {
+    state.unreadableCount += 1;
+    return [];
+  }
+  const nextAncestors = new Set(ancestors);
+  nextAncestors.add(parentId);
+  const out: string[] = [];
+  for (const item of children.get(parentId) ?? []) {
+    const block = await renderForwardItem(item, children, channel, state, nextAncestors);
+    if (block) out.push(block);
+  }
+  return out;
+}
+
+async function renderForwardItem(
+  item: RawMsgItem,
+  children: Map<string, RawMsgItem[]>,
+  channel: LarkChannel,
+  state: { unreadableCount: number; renderedIds: Set<string> },
+  ancestors: Set<string>,
+): Promise<string> {
+  const itemId = item.message_id ?? '';
+  if (itemId) state.renderedIds.add(itemId);
+  else state.unreadableCount += 1;
+  const name = item.sender?.sender_name || (item.sender?.id ? `用户${item.sender.id.slice(-4)}` : '某人');
+  const timestamp = formatForwardedTime(item.create_time);
+  let content = '';
+
+  if (item.deleted) {
+    state.unreadableCount += 1;
+    content = '[消息已撤回，正文不可读]';
+  } else if (item.msg_type === 'merge_forward' || item.msg_type === 'forward') {
+    const nested = itemId
+      ? await renderForwardTree(itemId, children, channel, state, ancestors)
+      : [];
+    if (nested.length === 0) {
+      state.unreadableCount += 1;
+      content = '[转发消息正文未读取到]';
+    } else {
+      content = `<forwarded_messages>\n${nested.join('\n')}\n</forwarded_messages>`;
+    }
+  } else if (item.msg_type === 'interactive') {
+    const fallback = extractMessageText(item.msg_type, item.body?.content, item.mentions);
+    if (itemId && isLikelyIncompleteCardText(fallback)) {
+      const card = await fetchInteractiveCardContent(channel, itemId);
+      if (card.text) content = card.text;
+      else content = fallback;
+      if (!card.complete) state.unreadableCount += 1;
+    } else {
+      content = fallback;
+    }
+  } else {
+    content = extractMessageText(item.msg_type, item.body?.content, item.mentions);
+    if (isUnreadableForwardType(item.msg_type, content)) state.unreadableCount += 1;
+  }
+
+  if (!content.trim()) {
+    state.unreadableCount += 1;
+    content = '[转发消息正文未读取到]';
+  }
+  const indented = content
+    .split('\n')
+    .map((line) => `    ${line}`)
+    .join('\n');
+  return `[${timestamp}] ${name}:\n${indented}`;
+}
+
+function isUnreadableForwardType(msgType: string | undefined, content: string): boolean {
+  if (msgType === 'text' || msgType === 'post') {
+    return /^\[(text|post) 消息\]$/.test(content.trim());
+  }
+  // Interactive and nested-forward records are handled before this helper.
+  // Every other type is either an attachment or an SDK shape we do not know
+  // how to render; mark it incomplete instead of claiming the placeholder is
+  // the real content.
+  return true;
+}
+
+function formatForwardedTime(value: string | number | undefined): string {
+  const ms = Number(value) || 0;
+  if (ms <= 0) return '时间未知';
+  try {
+    return new Date(ms).toISOString();
+  } catch {
+    return '时间未知';
+  }
 }
 
 // ── pulling ──────────────────────────────────────────────────────────────
@@ -83,7 +270,7 @@ export async function fetchQuotedMessage(
     const items = (res.data as { items?: RawMsgItem[] } | undefined)?.items ?? [];
     const item = items[0];
     if (!item || item.deleted) return undefined;
-    const cm = toContextMessage(item);
+    const cm = await toContextMessage(channel, item);
     return cm.text.trim() ? cm : undefined;
   } catch (err) {
     log.warn('intake', 'quote-fetch-failed', { messageId, err: String(err) });
@@ -97,8 +284,10 @@ export async function fetchQuotedMessage(
  *     as opening context.
  *   - `sinceTime > 0` (existing session): return only messages newer than that —
  *     the chatter that happened between bot turns (codex already has the rest).
- * Bot/app/system messages and the triggering @ message are filtered out. Returns
- * [] on any failure (best-effort). Result is oldest→newest.
+ * Bot/app/system messages and the triggering @ message are filtered out. A
+ * history API failure returns one bridge status message so codex can ask for
+ * the missing source instead of silently acting without context. Result is
+ * oldest→newest.
  */
 export async function fetchThreadContext(
   channel: LarkChannel,
@@ -117,16 +306,28 @@ export async function fetchThreadContext(
       },
     });
     const items = (res.data as { items?: RawMsgItem[] } | undefined)?.items ?? [];
-    const picked = items
-      .filter((it) => !it.deleted)
-      .map(toContextMessage)
-      .filter(
-        (m) =>
-          m.fromUser && // drop the bot's own replies, other apps, system notices
-          m.messageId !== opts.excludeMessageId && // drop the triggering @ message
-          (since === 0 || m.createTime > since) && // delta only for existing sessions
-          m.text.trim().length > 0,
-      );
+    const converted = await Promise.all(
+      items
+        .filter((it) => !it.deleted)
+        .map(async (item) => {
+          try {
+            return await toContextMessage(channel, item);
+          } catch (err) {
+            // A single malformed forwarded child must not erase the rest of a
+            // topic's context. Keep a visible status block so codex can ask for
+            // the missing source instead of guessing.
+            log.warn('intake', 'context-message-convert-failed', { messageId: item.message_id ?? '', err: String(err) });
+            return fallbackContextMessage(item, appendIncompleteContentNotice('', 'forwarded-messages'));
+          }
+        }),
+    );
+    const picked = converted.filter(
+      (m) =>
+        (m.fromUser || m.bridgeNotice) && // drop the bot's own replies, other apps, system notices
+        m.messageId !== opts.excludeMessageId && // drop the triggering @ message
+        (since === 0 || m.createTime > since) && // delta only for existing sessions
+        m.text.trim().length > 0,
+    );
     // `list` returned newest-first; weave oldest→newest, keeping the most recent `limit`.
     picked.sort((a, b) => a.createTime - b.createTime);
     const out = picked.slice(-limit);
@@ -136,7 +337,16 @@ export async function fetchThreadContext(
     return out;
   } catch (err) {
     log.warn('intake', 'thread-context-failed', { threadId, err: String(err) });
-    return [];
+    return [
+      {
+        messageId: `bridge-thread-read-${threadId}`,
+        senderName: '桥接层',
+        text: appendIncompleteContentNotice('', 'forwarded-messages', '话题上文读取接口失败'),
+        fromUser: false,
+        bridgeNotice: true,
+        createTime: Date.now(),
+      },
+    ];
   }
 }
 
@@ -155,14 +365,44 @@ export function filterHistorySince(msgs: ContextMessage[], sinceTime: number): C
   return msgs.filter((m) => m.createTime > sinceTime);
 }
 
-function toContextMessage(item: RawMsgItem): ContextMessage {
+async function toContextMessage(channel: LarkChannel, item: RawMsgItem): Promise<ContextMessage> {
   const id = item.sender?.id ?? '';
   const name = item.sender?.sender_name || (id ? `用户${id.slice(-4)}` : '某人');
+  let text = extractMessageText(item.msg_type, item.body?.content, item.mentions);
+  if (item.msg_type === 'interactive') {
+    if (item.message_id && isLikelyIncompleteCardText(text)) {
+      const card = await fetchInteractiveCardContent(channel, item.message_id);
+      if (card.text) text = card.text;
+      if (!card.complete) {
+        text = appendIncompleteContentNotice(text, 'interactive-card', card.text);
+      }
+    }
+  } else if (item.msg_type === 'merge_forward' || item.msg_type === 'forward') {
+    const forwarded = item.message_id
+      ? await fetchForwardedMessageContent(channel, item.message_id)
+      : { complete: false as const, reason: 'empty-response' as const, itemCount: 0, unreadableCount: 0, truncated: false };
+    if (forwarded.text) text = forwarded.text;
+    if (!forwarded.complete) {
+      text = appendIncompleteContentNotice(text, 'forwarded-messages', forwarded.text);
+    }
+  }
   return {
     messageId: item.message_id ?? '',
     senderName: name,
-    text: extractMessageText(item.msg_type, item.body?.content, item.mentions),
+    text,
     fromUser: item.sender?.sender_type === 'user',
+    createTime: Number(item.create_time) || 0,
+  };
+}
+
+function fallbackContextMessage(item: RawMsgItem, text: string): ContextMessage {
+  const id = item.sender?.id ?? '';
+  return {
+    messageId: item.message_id ?? '',
+    senderName: item.sender?.sender_name || (id ? `用户${id.slice(-4)}` : '某人'),
+    text,
+    fromUser: item.sender?.sender_type === 'user',
+    bridgeNotice: item.sender?.sender_type === 'user',
     createTime: Number(item.create_time) || 0,
   };
 }

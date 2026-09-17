@@ -200,7 +200,11 @@ import {
   type SessionTitleSource,
 } from './session-title';
 import { handleDmConsole } from './dm-console';
-import { fetchInteractiveCardText, isDegradedCardContent } from './card-content';
+import {
+  fetchInteractiveCardContent,
+  isLikelyIncompleteCardText,
+} from './card-content';
+import { appendIncompleteContentNotice } from './inbound-content';
 import {
   collectInboundFiles,
   collectInboundImages,
@@ -211,6 +215,7 @@ import {
 } from './media';
 import {
   fetchQuotedMessage,
+  fetchForwardedMessageContent,
   fetchThreadContext,
   filterHistorySince,
   weaveQuote,
@@ -927,16 +932,44 @@ export function createOrchestrator(
       return;
     }
 
-    // 多维表格「发送消息卡片」等 card 2.0 交互卡片：推送事件 / 旧版 content 只给降级
-    // 占位（SDK 归一化成 "[interactive card]"，或「请升级至最新版本客户端…」），真正的
-    // 卡片正文（含 Base 记录链接）要带 card_msg_content_type=raw_card_content 回查才拿得
-    // 到。命中降级时回查并把正文塞回 msg.content，让 codex 读到「请处理这条记录
-    // [查看…](base链接)」并据此（配合 lark-cli skill）继续处理。
-    if (msg.rawContentType === 'interactive' && isDegradedCardContent(msg.content)) {
-      const full = await fetchInteractiveCardText(channel, msg.messageId);
-      if (full) {
-        log.info('intake', 'card-content-enriched', { msgId: msg.messageId, len: full.length });
-        msg.content = full;
+    // 多维表格「发送消息卡片」等 card 2.0 交互卡片：推送事件 / 旧版 content
+    // 可能只有降级占位，也可能只剩标题。每次都用 raw_card_content 回查，
+    // 因为“有一个标题”不能证明正文已读到；读不到时把明确的状态交给 codex，
+    // 禁止它根据标题、历史或常识猜票号、SKU、链接等缺失字段。
+    if (msg.rawContentType === 'interactive') {
+      const before = msg.content;
+      const card = await fetchInteractiveCardContent(channel, msg.messageId);
+      if (card.text && (card.complete || isLikelyIncompleteCardText(before))) {
+        msg.content = card.text;
+      }
+      if (!card.complete && isLikelyIncompleteCardText(before)) {
+        msg.content = appendIncompleteContentNotice(msg.content, 'interactive-card', card.text);
+        log.warn('intake', 'card-content-incomplete', {
+          msgId: msg.messageId,
+          reason: card.reason ?? 'unknown',
+          len: card.text?.length ?? 0,
+        });
+      } else if (card.text && card.complete) {
+        log.info('intake', 'card-content-enriched', { msgId: msg.messageId, len: card.text.length });
+      }
+    } else if (msg.rawContentType === 'merge_forward' || msg.rawContentType === 'forward') {
+      // SDK 的直接入站转换有时已经展开转发消息，但其中的交互卡片仍可能
+      // 只有标题。重新按 message_id 拉平并展开，确保同一套兼容逻辑覆盖
+      // 话题、引用和直接 @ 三种入口。
+      const before = msg.content;
+      const forwarded = await fetchForwardedMessageContent(channel, msg.messageId);
+      if (forwarded.text) msg.content = forwarded.text;
+      if (!forwarded.complete) {
+        msg.content = appendIncompleteContentNotice(msg.content || before, 'forwarded-messages', forwarded.text);
+        log.warn('intake', 'forwarded-content-incomplete', {
+          msgId: msg.messageId,
+          reason: forwarded.reason ?? 'unknown',
+          itemCount: forwarded.itemCount,
+          unreadableCount: forwarded.unreadableCount,
+          truncated: forwarded.truncated,
+        });
+      } else if (forwarded.text) {
+        log.info('intake', 'forwarded-content-enriched', { msgId: msg.messageId, itemCount: forwarded.itemCount });
       }
     }
 
@@ -1212,7 +1245,9 @@ export function createOrchestrator(
     }
     if (msg.replyToMessageId) {
       const quoted = await fetchQuotedMessage(channel, msg.replyToMessageId);
-      body = weaveQuote(body, quoted);
+      body = quoted
+        ? weaveQuote(body, quoted)
+        : appendIncompleteContentNotice(body, 'quoted-message');
     }
     // Identity weave (outermost within ingestContext): fold WHO sent this turn so
     // codex can match the roster (approve-gate) and @ them back. Covers both the
