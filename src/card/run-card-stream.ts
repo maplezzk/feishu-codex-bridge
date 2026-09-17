@@ -279,6 +279,7 @@ export class RunCardStream {
         '内容更新',
       );
     await this.pacer?.wait();
+    if (this.transportBroken) return false;
     const t0 = Date.now();
     try {
       try {
@@ -409,6 +410,7 @@ export class RunCardStream {
     if (!force && now - this.lastPush < STREAM_THROTTLE_MS) return false;
     this.lastPush = now;
     await this.pacer?.wait();
+    if (this.transportBroken) return false;
     const t0 = Date.now();
     try {
       await withCardApiTimeout(
@@ -507,6 +509,7 @@ export class RunCardStream {
     for (let i = 0; ; i++) {
       if (this.transportBroken) return false;
       await this.pacer?.wait();
+      if (this.transportBroken) return false;
       try {
         await push();
         return true;
