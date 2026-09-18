@@ -216,6 +216,7 @@ import {
 import {
   fetchQuotedMessage,
   fetchForwardedMessageContent,
+  describeForwardedMessageReadStatus,
   fetchThreadContext,
   filterHistorySince,
   weaveQuote,
@@ -977,12 +978,19 @@ export function createOrchestrator(
       const forwarded = await fetchForwardedMessageContent(channel, msg.messageId);
       if (forwarded.text) msg.content = forwarded.text;
       if (!forwarded.complete) {
-        msg.content = appendIncompleteContentNotice(msg.content || before, 'forwarded-messages', forwarded.text);
+        msg.content = appendIncompleteContentNotice(
+          msg.content || before,
+          'forwarded-messages',
+          describeForwardedMessageReadStatus(forwarded),
+          { partialReadable: Boolean(forwarded.text && forwarded.itemCount > forwarded.unreadableCount) },
+        );
         log.warn('intake', 'forwarded-content-incomplete', {
           msgId: msg.messageId,
           reason: forwarded.reason ?? 'unknown',
           itemCount: forwarded.itemCount,
+          readableCount: Math.max(0, forwarded.itemCount - forwarded.unreadableCount),
           unreadableCount: forwarded.unreadableCount,
+          unreadableAttachmentCount: forwarded.unreadableAttachmentCount,
           truncated: forwarded.truncated,
         });
       } else if (forwarded.text) {

@@ -83,7 +83,15 @@ export interface ForwardedMessageContent {
   itemCount: number;
   /** Descendants that were attachments, deleted, malformed, or otherwise unreadable. */
   unreadableCount: number;
+  /** Unreadable descendants whose resource body was an image/file/audio/video/sticker. */
+  unreadableAttachmentCount: number;
   truncated: boolean;
+}
+
+interface ForwardRenderState {
+  unreadableCount: number;
+  unreadableAttachmentCount: number;
+  renderedIds: Set<string>;
 }
 
 const FORWARDED_MAX_ITEMS = 50;
@@ -105,16 +113,16 @@ export async function fetchForwardedMessageContent(
     items = ((res.data as { items?: RawMsgItem[] } | undefined)?.items ?? []).filter(Boolean);
   } catch (err) {
     log.warn('intake', 'forwarded-content-fetch-failed', { messageId, err: String(err) });
-    return { complete: false, reason: 'fetch-failed', itemCount: 0, unreadableCount: 0, truncated: false };
+    return { complete: false, reason: 'fetch-failed', itemCount: 0, unreadableCount: 0, unreadableAttachmentCount: 0, truncated: false };
   }
   if (items.length === 0) {
-    return { complete: false, reason: 'empty-response', itemCount: 0, unreadableCount: 0, truncated: false };
+    return { complete: false, reason: 'empty-response', itemCount: 0, unreadableCount: 0, unreadableAttachmentCount: 0, truncated: false };
   }
 
   const capped = items.slice(0, FORWARDED_MAX_ITEMS);
   const truncated = items.length > FORWARDED_MAX_ITEMS;
   const children = buildForwardChildren(capped, messageId);
-  const state = { unreadableCount: 0, renderedIds: new Set<string>() };
+  const state: ForwardRenderState = { unreadableCount: 0, unreadableAttachmentCount: 0, renderedIds: new Set<string>() };
   const blocks = await renderForwardTree(messageId, children, channel, state, new Set<string>());
   const itemCount = [...children.values()].reduce((n, list) => n + list.length, 0);
   const renderedCount = [...state.renderedIds].length;
@@ -125,6 +133,7 @@ export async function fetchForwardedMessageContent(
       reason: 'empty-content',
       itemCount,
       unreadableCount: state.unreadableCount,
+      unreadableAttachmentCount: state.unreadableAttachmentCount,
       truncated,
     };
   }
@@ -137,8 +146,42 @@ export async function fetchForwardedMessageContent(
     reason: truncated ? 'truncated' : state.unreadableCount > 0 ? 'unreadable-child' : undefined,
     itemCount,
     unreadableCount: state.unreadableCount,
+    unreadableAttachmentCount: state.unreadableAttachmentCount,
     truncated,
   };
+}
+
+/**
+ * Turn the structured read result into a short, truthful status line.  Do not
+ * pass the full forwarded body here: flattening it to a fixed number of chars
+ * made a complete text tail look as if it had never been read.
+ */
+export function describeForwardedMessageReadStatus(content: ForwardedMessageContent): string | undefined {
+  const readableCount = Math.max(0, content.itemCount - content.unreadableCount);
+  switch (content.reason) {
+    case 'unreadable-child': {
+      const parts: string[] = [];
+      if (readableCount > 0) parts.push(`已读取 ${readableCount} 条转发消息的文字内容`);
+      if (content.unreadableAttachmentCount > 0) {
+        parts.push(`${content.unreadableAttachmentCount} 条图片或附件的实际内容未能读取`);
+      }
+      const otherUnreadable = content.unreadableCount - content.unreadableAttachmentCount;
+      if (otherUnreadable > 0) parts.push(`${otherUnreadable} 条子消息正文未能读取`);
+      return parts.length > 0 ? `${parts.join('；')}。` : undefined;
+    }
+    case 'truncated':
+      return `已读取 ${content.itemCount} 条转发消息；超过 50 条的后续消息没有读取。`;
+    case 'fetch-failed':
+      return '转发消息读取接口失败，没有可确认的正文。';
+    case 'empty-response':
+      return '转发消息读取接口返回空结果，没有可确认的正文。';
+    case 'empty-content':
+      return content.itemCount > 0
+        ? `已取得 ${content.itemCount} 条转发记录，但没有可读取的正文。`
+        : '没有可读取的转发正文。';
+    default:
+      return undefined;
+  }
 }
 
 function buildForwardChildren(items: RawMsgItem[], rootId: string): Map<string, RawMsgItem[]> {
@@ -164,7 +207,7 @@ async function renderForwardTree(
   parentId: string,
   children: Map<string, RawMsgItem[]>,
   channel: LarkChannel,
-  state: { unreadableCount: number; renderedIds: Set<string> },
+  state: ForwardRenderState,
   ancestors: Set<string>,
 ): Promise<string[]> {
   if (ancestors.has(parentId)) {
@@ -185,25 +228,25 @@ async function renderForwardItem(
   item: RawMsgItem,
   children: Map<string, RawMsgItem[]>,
   channel: LarkChannel,
-  state: { unreadableCount: number; renderedIds: Set<string> },
+  state: ForwardRenderState,
   ancestors: Set<string>,
 ): Promise<string> {
   const itemId = item.message_id ?? '';
   if (itemId) state.renderedIds.add(itemId);
-  else state.unreadableCount += 1;
+  else markForwardUnreadable(state);
   const name = item.sender?.sender_name || (item.sender?.id ? `用户${item.sender.id.slice(-4)}` : '某人');
   const timestamp = formatForwardedTime(item.create_time);
   let content = '';
 
   if (item.deleted) {
-    state.unreadableCount += 1;
+    markForwardUnreadable(state);
     content = '[消息已撤回，正文不可读]';
   } else if (item.msg_type === 'merge_forward' || item.msg_type === 'forward') {
     const nested = itemId
       ? await renderForwardTree(itemId, children, channel, state, ancestors)
       : [];
     if (nested.length === 0) {
-      state.unreadableCount += 1;
+      markForwardUnreadable(state);
       content = '[转发消息正文未读取到]';
     } else {
       content = `<forwarded_messages>\n${nested.join('\n')}\n</forwarded_messages>`;
@@ -214,17 +257,18 @@ async function renderForwardItem(
       const card = await fetchInteractiveCardContent(channel, itemId);
       if (card.text) content = card.text;
       else content = fallback;
-      if (!card.complete) state.unreadableCount += 1;
+      if (!card.complete) markForwardUnreadable(state);
     } else {
       content = fallback;
     }
   } else {
     content = extractMessageText(item.msg_type, item.body?.content, item.mentions);
-    if (isUnreadableForwardType(item.msg_type, content)) state.unreadableCount += 1;
+    const unreadableKind = unreadableForwardKind(item.msg_type, content);
+    if (unreadableKind) markForwardUnreadable(state, unreadableKind === 'attachment');
   }
 
   if (!content.trim()) {
-    state.unreadableCount += 1;
+    markForwardUnreadable(state);
     content = '[转发消息正文未读取到]';
   }
   const indented = content
@@ -234,15 +278,25 @@ async function renderForwardItem(
   return `[${timestamp}] ${name}:\n${indented}`;
 }
 
-function isUnreadableForwardType(msgType: string | undefined, content: string): boolean {
+function unreadableForwardKind(msgType: string | undefined, content: string): 'attachment' | 'body' | undefined {
   if (msgType === 'text' || msgType === 'post') {
-    return /^\[(text|post) 消息\]$/.test(content.trim());
+    return /^\[(text|post) 消息\]$/.test(content.trim()) ? 'body' : undefined;
   }
   // Interactive and nested-forward records are handled before this helper.
-  // Every other type is either an attachment or an SDK shape we do not know
-  // how to render; mark it incomplete instead of claiming the placeholder is
-  // the real content.
-  return true;
+  // Resource messages have a truthful placeholder, but their actual bytes are
+  // not present in the forwarded body.  Keep the placeholder and report the
+  // missing attachment separately so readable text remains usable.
+  if (msgType === 'image' || msgType === 'audio' || msgType === 'media' || msgType === 'file' || msgType === 'sticker') {
+    return 'attachment';
+  }
+  // Every other type is either a structured message we do not know how to
+  // render or an SDK shape that did not yield readable text.
+  return 'body';
+}
+
+function markForwardUnreadable(state: ForwardRenderState, attachment = false): void {
+  state.unreadableCount += 1;
+  if (attachment) state.unreadableAttachmentCount += 1;
 }
 
 function formatForwardedTime(value: string | number | undefined): string {
@@ -380,10 +434,19 @@ async function toContextMessage(channel: LarkChannel, item: RawMsgItem): Promise
   } else if (item.msg_type === 'merge_forward' || item.msg_type === 'forward') {
     const forwarded = item.message_id
       ? await fetchForwardedMessageContent(channel, item.message_id)
-      : { complete: false as const, reason: 'empty-response' as const, itemCount: 0, unreadableCount: 0, truncated: false };
+      : {
+          complete: false as const,
+          reason: 'empty-response' as const,
+          itemCount: 0,
+          unreadableCount: 0,
+          unreadableAttachmentCount: 0,
+          truncated: false,
+        };
     if (forwarded.text) text = forwarded.text;
     if (!forwarded.complete) {
-      text = appendIncompleteContentNotice(text, 'forwarded-messages', forwarded.text);
+      text = appendIncompleteContentNotice(text, 'forwarded-messages', describeForwardedMessageReadStatus(forwarded), {
+        partialReadable: Boolean(forwarded.text && forwarded.itemCount > forwarded.unreadableCount),
+      });
     }
   }
   return {

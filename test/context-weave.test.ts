@@ -3,6 +3,7 @@ import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import {
   extractCardText,
   extractMessageText,
+  describeForwardedMessageReadStatus,
   fetchForwardedMessageContent,
   fetchQuotedMessage,
   fetchThreadContext,
@@ -294,6 +295,7 @@ describe('fetchForwardedMessageContent', () => {
     const out = await fetchForwardedMessageContent(
       fakeChannel([
         { message_id: 'om_root', msg_type: 'merge_forward', sender: { id: 'ou_root', sender_type: 'user', sender_name: '转发人' }, body: { content: '{}' } },
+        { message_id: 'om_text', upper_message_id: 'om_root', msg_type: 'text', sender: { id: 'ou_t', sender_type: 'user', sender_name: '甲' }, body: { content: JSON.stringify({ text: '图片之前的文字' }) } },
         { message_id: 'om_img', upper_message_id: 'om_root', msg_type: 'image', sender: { id: 'ou_a', sender_type: 'user', sender_name: '甲' }, body: { content: JSON.stringify({ image_key: 'img' }) } },
       ]),
       'om_root',
@@ -301,7 +303,9 @@ describe('fetchForwardedMessageContent', () => {
     expect(out.complete).toBe(false);
     expect(out.reason).toBe('unreadable-child');
     expect(out.unreadableCount).toBe(1);
+    expect(out.unreadableAttachmentCount).toBe(1);
     expect(out.text).toContain('[图片]');
+    expect(describeForwardedMessageReadStatus(out)).toBe('已读取 1 条转发消息的文字内容；1 条图片或附件的实际内容未能读取。');
   });
 
   it('does not treat an unknown forwarded message type as readable text', async () => {
@@ -315,6 +319,7 @@ describe('fetchForwardedMessageContent', () => {
     expect(out.complete).toBe(false);
     expect(out.reason).toBe('unreadable-child');
     expect(out.text).toContain('[location 消息]');
+    expect(out.unreadableAttachmentCount).toBe(0);
   });
 });
 
