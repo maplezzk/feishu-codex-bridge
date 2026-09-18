@@ -285,6 +285,46 @@ describe('mapNotification', () => {
     });
   });
 
+  it('keeps Codex collaboration calls visible with child status and failure state', () => {
+    const collab = {
+      type: 'collabAgentToolCall',
+      id: 'collab-1',
+      tool: 'spawnAgent',
+      status: 'inProgress',
+      senderThreadId: 'thread-1',
+      receiverThreadIds: ['agent-123456789'],
+      prompt: '检查 bridge 的子任务生命周期',
+      model: 'gpt-5.6-luna',
+      reasoningEffort: 'max',
+      agentsStates: {
+        'agent-123456789': { status: 'running', message: '正在读取日志' },
+      },
+    } as unknown as ThreadItem;
+    const started = mapNotification(itemStarted(collab));
+    expect(started).toEqual({
+      type: 'tool_use',
+      itemId: 'collab-1',
+      title: '启动子任务 · 检查 bridge 的子任务生命周期（…23456789 · 运行中：正在读取日志）',
+      kind: 'tool',
+    });
+
+    const failed = mapNotification(
+      itemCompleted({
+        ...collab,
+        status: 'failed',
+        agentsStates: {
+          'agent-123456789': { status: 'errored', message: '子任务无响应' },
+        },
+      } as unknown as ThreadItem),
+    );
+    expect(failed).toEqual({
+      type: 'tool_result',
+      itemId: 'collab-1',
+      output: '❌ 协作调用失败\n目标子任务：…23456789\n…23456789 · 出错：子任务无响应',
+      exitCode: 1,
+    });
+  });
+
   it('maps token usage + compaction notifications', () => {
     // Reads `last` (current context occupancy), NOT `total` (cumulative). A high
     // cumulative total alongside a small last must surface the small one.

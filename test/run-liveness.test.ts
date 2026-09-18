@@ -23,7 +23,9 @@ process.stdin.on('data', (d) => {
     if (msg.method === 'turn/start') {
       send({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 't_live' } } });
       setInterval(() => {
-        send({ jsonrpc: '2.0', method: 'item/commandExecution/outputDelta', params: { threadId: 'th_live', turnId: 't_live', itemId: 'i1', delta: 'x' } });
+        const turnId = process.env.RUN_LIVENESS_CHILD === '1' ? 'child_turn' : 't_live';
+        const threadId = process.env.RUN_LIVENESS_CHILD === '1' ? 'child_thread' : 'th_live';
+        send({ jsonrpc: '2.0', method: 'item/commandExecution/outputDelta', params: { threadId, turnId, itemId: 'i1', delta: 'x' } });
       }, 20);
       continue;
     }
@@ -65,6 +67,31 @@ describe.skipIf(process.platform === 'win32')('runStreamed 原始通知刷新 la
     } finally {
       if (prev === undefined) delete process.env.CODEX_BIN;
       else process.env.CODEX_BIN = prev;
+    }
+  });
+
+  it('counts child-thread notifications as liveness even though they are not rendered', async () => {
+    const prev = process.env.RUN_LIVENESS_CHILD;
+    process.env.RUN_LIVENESS_CHILD = '1';
+    try {
+      const backend = new CodexAppServerBackend();
+      const thread = await backend.startThread({ cwd: dir });
+      const run = thread.runStreamed({ text: 'go' });
+      const iter = run.events[Symbol.asyncIterator]();
+      const pending = iter.next();
+      const before = run.lastActivity!();
+
+      // The fake server emits only child thread/turn ids. The backend must still move
+      // the raw-activity clock before filtering the notification from the
+      // parent's normalized event stream; otherwise the watchdog would kill a
+      // parent while its subagent is producing output.
+      await vi.waitFor(() => expect(run.lastActivity!()).toBeGreaterThan(before));
+
+      await thread.close();
+      await expect(pending).resolves.toMatchObject({ done: true });
+    } finally {
+      if (prev === undefined) delete process.env.RUN_LIVENESS_CHILD;
+      else process.env.RUN_LIVENESS_CHILD = prev;
     }
   });
 });

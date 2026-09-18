@@ -75,6 +75,11 @@ export class AppServerClient {
   private readonly notifications = new AsyncQueue<ServerNotification>();
   private closed = false;
   private hasExited = false;
+  /** A live process can still become unusable when Codex loses a custom
+   * collaboration-tool result or a subagent registration. Keep that state
+   * separate from `exited`: callers can finish reporting the current turn and
+   * then recycle the process instead of reusing a poisoned session. */
+  private protocolFaultReason: string | undefined;
 
   constructor(private readonly opts: AppServerClientOptions) {}
 
@@ -88,6 +93,16 @@ export class AppServerClient {
    * can take over instead of reusing a corpse. */
   get exited(): boolean {
     return this.hasExited;
+  }
+
+  /** True when stderr proves that Codex's collaboration/tool lifecycle is out
+   * of sync. The process may still be alive, but a later turn must not reuse it. */
+  get needsRecycle(): boolean {
+    return Boolean(this.protocolFaultReason);
+  }
+
+  get recycleReason(): string | undefined {
+    return this.protocolFaultReason;
   }
 
   /** spawn + initialize handshake. Throws if spawn/handshake fails. */
@@ -106,7 +121,13 @@ export class AppServerClient {
     child.stdout.on('data', (d: Buffer) => this.onStdout(d));
     child.stderr.on('data', (d: Buffer) => {
       const line = d.toString('utf8').trim();
-      if (line) log.warn('agent', 'stderr', { line: line.slice(0, 200) });
+      if (!line) return;
+      const fault = protocolFaultIn(line);
+      if (fault && !this.protocolFaultReason) {
+        this.protocolFaultReason = fault;
+        log.warn('agent', 'protocol-fault', { pid: child.pid ?? null, reason: fault });
+      }
+      log.warn('agent', 'stderr', { line: line.slice(0, 200) });
     });
     child.on('exit', (code, signal) => {
       log.info('agent', 'exit', { pid: child.pid ?? null, code, signal });
@@ -260,4 +281,16 @@ export class AppServerClient {
     for (const p of this.pending.values()) p.reject(err);
     this.pending.clear();
   }
+}
+
+/** Known Codex core errors that leave the collaboration registry or a custom
+ * tool call unresolved. They are recoverable only by recycling the app-server
+ * process; keeping it in the live-session cache makes every later turn inherit
+ * the stale registry. */
+function protocolFaultIn(stderr: string): string | undefined {
+  if (/Custom tool call output is missing for call id:/i.test(stderr)) {
+    return 'missing-custom-tool-output';
+  }
+  if (/agent with id .* not found/i.test(stderr)) return 'subagent-not-found';
+  return undefined;
 }

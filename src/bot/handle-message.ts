@@ -444,10 +444,23 @@ export function isCompletionReminderRequester(operatorOpenId?: string, requester
  */
 export function settleOrdinaryTurnRender(
   render: RunRender,
-  input: { interrupted: boolean; timedOut: boolean; idleTimeoutSeconds: number; procDead: boolean },
+  input: {
+    interrupted: boolean;
+    timedOut: boolean;
+    idleTimeoutSeconds: number;
+    procDead: boolean;
+    protocolFault?: string;
+  },
 ): void {
   if (input.interrupted) render.interrupt();
   else if (input.timedOut) render.timeout(input.idleTimeoutSeconds);
+  else if (input.protocolFault) {
+    render.apply({
+      type: 'error',
+      message: `agent 协作状态异常（${input.protocolFault}），请重发本条消息`,
+      willRetry: false,
+    });
+  }
   else if (input.procDead && render.terminal() === 'running') {
     render.apply({ type: 'error', message: 'agent 进程异常退出，请重发本条消息', willRetry: false });
   } else {
@@ -785,6 +798,10 @@ export function createOrchestrator(
   /** CardKit entity backing each run card, by messageId — drives the native
    * typewriter stream and whole-card (button/settings) updates. */
   const runStreams = new Map<string, RunCardStream>();
+  /** Streams whose initial card create/repaint has not returned a messageId
+   * yet. They are kept separately so explicit shutdown can cancel their retry
+   * loop even before runStreams receives its message-keyed entry. */
+  const pendingCardStreams = new Set<RunCardStream>();
   /** Live manual-reminder card repaint, keyed like runsByCard. The closure is
    * swapped when a queue placeholder flips into a run card, so a double click
    * can only mutate the one current turn and never an older/future card. */
@@ -1593,12 +1610,22 @@ export function createOrchestrator(
   ): Promise<{ thread: AgentThread | undefined; recreated: boolean }> {
     const live = sessions.get(threadId);
     if (live) {
-      if (live.isAlive()) return { thread: live, recreated: false };
+      const needsRecycle = live.needsRecycle?.() ?? false;
+      if (live.isAlive() && !needsRecycle) return { thread: live, recreated: false };
       // app-server 子进程已死（崩溃/被 kill）：死线程留在缓存只会反复失败，
       // 清掉让它落入下面既有的 resume-or-recreate 兜底（持久化的 sessionId
       // 还在，话题自愈而不是僵死到重启）。
       sessions.delete(threadId);
-      log.info('agent', 'dead-thread-evict', { threadId });
+      sessionTouchedAt.delete(threadId);
+      if (needsRecycle) {
+        void live.close().catch(() => undefined);
+        log.info('agent', 'unhealthy-thread-evict', {
+          threadId,
+          reason: live.recycleReason?.() ?? 'Codex 协作状态已失步',
+        });
+      } else {
+        log.info('agent', 'dead-thread-evict', { threadId });
+      }
     }
     const rec = await getSession(threadId);
     if (!rec) return { thread: undefined, recreated: false };
@@ -3974,32 +4001,13 @@ export function createOrchestrator(
       // 前面有人拿到槽/取消 → 原地刷新位置。走合并泵（非阻塞、合并、限频）。
       if (msgId) stream.streamCoalesced(channel, queueCard({ position: pos, cardKey: msgId }), null);
     });
-    try {
-      msgId = await stream.create(channel, opts.chatId, queueCard({ position: q.position() }), {
-        replyTo: opts.replyTo,
-        replyInThread: opts.flat ? false : (opts.replyInThread ?? Boolean(opts.knownThreadId)),
-      });
-      // 自指按钮（m = 自己的 messageId）只能在拿到 messageId 后补上。建卡 RTT 里
-      // 槽可能已到手（position()=0）——那就不补按钮，run 卡马上原地接管。
-      const pos = q.position();
-      if (pos > 0) await stream.updateCard(channel, queueCard({ position: pos, cardKey: msgId }));
-      runsByCard.set(msgId, state);
-      runStreams.set(msgId, stream);
-      if (!state.isGoal) {
-        const key = msgId;
-        completionReminderRefreshers.set(key, () => {
-          const currentPos = q.position();
-          if (currentPos > 0) void stream.updateLiveCard(channel, queueCard({ position: currentPos, cardKey: key }));
-        });
-      }
-    } catch (err) {
-      // 占位卡失败不阻断排队：没有卡只是不可见/不可取消，run 照常等槽。
-      log.fail('card', err, { phase: 'queued-card' });
-    }
-    log.info('intake', 'run-queued', { position: q.position(), key: activeKey });
-    // 等待期 ⏹ = 移除 waiter + 释放预订。槽已到手的瞬间 cancel() 返回 false →
-    // 让位给运行期 interrupt（launchRun 每轮重装）。
+    pendingCardStreams.add(stream);
+    // The initial placeholder send can itself be waiting on an indefinite
+    // transport retry. Install the cancel hook before awaiting it so ⏹ remains
+    // effective during that phase; once the slot is granted q.cancel() returns
+    // false and launchRun replaces this hook with the turn interrupt.
     state.interrupt = () => {
+      if (q.position() > 0) stream.stopRetries(false);
       if (!q.cancel()) return;
       active.delete(activeKey);
       if (opts.knownThreadId) sessions.delete(opts.knownThreadId);
@@ -4014,6 +4022,31 @@ export function createOrchestrator(
       reaction?.done();
       log.info('card', 'action', { actionId: 'run.stop', queuedCancel: true });
     };
+    try {
+      msgId = await stream.create(channel, opts.chatId, queueCard({ position: q.position() }), {
+        replyTo: opts.replyTo,
+        replyInThread: opts.flat ? false : (opts.replyInThread ?? Boolean(opts.knownThreadId)),
+      });
+      pendingCardStreams.delete(stream);
+      // 自指按钮（m = 自己的 messageId）只能在拿到 messageId 后补上。建卡 RTT 里
+      // 槽可能已到手（position()=0）——那就不补按钮，run 卡马上原地接管。
+      const pos = q.position();
+      if (pos > 0) await stream.updateCard(channel, queueCard({ position: pos, cardKey: msgId }));
+      runsByCard.set(msgId, state);
+      runStreams.set(msgId, stream);
+      if (!state.isGoal) {
+        const key = msgId;
+        completionReminderRefreshers.set(key, () => {
+          const currentPos = q.position();
+          if (currentPos > 0) void stream.updateLiveCard(channel, queueCard({ position: currentPos, cardKey: key }));
+        });
+      }
+    } catch (err) {
+      pendingCardStreams.delete(stream);
+      // 占位卡失败不阻断排队：没有卡只是不可见/不可取消，run 照常等槽。
+      log.fail('card', err, { phase: 'queued-card' });
+    }
+    log.info('intake', 'run-queued', { position: q.position(), key: activeKey });
     const release = await q.acquired;
     state.interrupt = undefined;
     if (!release) return null; // 已取消：占位卡已翻终态，预订已释放
@@ -4208,7 +4241,16 @@ export function createOrchestrator(
         // CardKit streaming entity: body streams with the native typewriter,
         // ⏹/⚙️ ride whole-card updates — both on one card_id (see RunCardStream).
         const stream = queuedCard?.stream ?? new RunCardStream();
+        let stopRequestedDuringCardSetup = false;
+        // turn/start was issued before card setup. Keep ⏹ effective while the
+        // initial create/queue-to-run repaint is in its transport retry loop;
+        // once setup succeeds the normal turn interrupt below replaces this hook.
+        state.interrupt = () => {
+          stopRequestedDuringCardSetup = true;
+          stream.stopRetries();
+        };
         const tCreate = Date.now();
+        pendingCardStreams.add(stream);
         try {
           if (queuedCard) {
             // 占位卡→run 卡：同一 CardKit 实体 whole-card update 原地翻面（不闪
@@ -4221,7 +4263,9 @@ export function createOrchestrator(
           } else {
             cardMsgId = await stream.create(channel, opts.chatId, buildRunCard(rc), { replyTo, replyInThread });
           }
+          pendingCardStreams.delete(stream);
         } catch (err) {
+          pendingCardStreams.delete(stream);
           // turn/start 已提前发出：建卡失败时模型已在跑，必须中断并回收进程——
           // 无人消费的通知流会污染该 thread 的下一轮。turnId 此时多半还没到手
           // （事件尚未消费），abort 仅尽力而为；close() SIGKILL 子进程兜底终结
@@ -4278,6 +4322,7 @@ export function createOrchestrator(
           forceStop: resolveStop,
         });
         state.interrupt = stopper.interrupt;
+        if (stopRequestedDuringCardSetup) stopper.interrupt();
         const idleMs = currentIdleMs();
         const guarded = withIdleTimeout(
           run.events,
@@ -4345,15 +4390,20 @@ export function createOrchestrator(
         // （forced）。优雅 ⏹（done 及时到达）不算 killed —— 线程与进程留用。
         const killed = timedOut || (interrupted && stopper.forced());
         // A child crash closes the notification iterator cleanly, so no error
-        // event is guaranteed. Detect liveness BEFORE finalizing: only a still-
-        // running render becomes error; an explicit backend done/error terminal
-        // remains authoritative.
+        // event is guaranteed. Detect process and protocol health BEFORE
+        // finalizing: a dead process or poisoned collaboration registry becomes
+        // an error instead of a false success; a clean backend terminal remains
+        // authoritative when no protocol fault was observed.
         const procDead = !killed && !opts.thread.isAlive();
+        const protocolFault = opts.thread.needsRecycle?.()
+          ? opts.thread.recycleReason?.() ?? 'Codex 协作状态已失步'
+          : undefined;
         settleOrdinaryTurnRender(render, {
           interrupted,
           timedOut,
           idleTimeoutSeconds: Math.round(idleMs / 1000),
           procDead,
+          protocolFault,
         });
         rc.rs = render.snapshot();
         if (interrupted) log.info('agent', 'interrupt', { graceful: !stopper.forced(), threadId: topicThreadId ?? null });
@@ -4367,10 +4417,10 @@ export function createOrchestrator(
         // 优雅 ⏹（killed=false）不回收：turn/completed(status:"interrupted") 已
         // 干净收尾，同进程同 thread 可继续复用（08b 探针已证）——sessions 保留、
         // 不 close，下一条消息走 LIVE 快路径。
-        // 进程级死亡（app-server 中途崩溃 → error 卡 / 轮间死 → 空卡，killed=false）
-        // 同走回收：立即清出缓存，下一条消息直接经 resolveThread 的 resume 兜底
-        // 自愈（快路径的 isAlive 守卫是兜底的兜底）。
-        if (killed || procDead) {
+        // 进程级死亡或 Codex 协作协议失步同走回收：立即清出缓存，下一条消息
+        // 直接经 resolveThread 的 resume 兜底自愈（快路径的健康检查是兜底的兜底）。
+        const recycle = killed || procDead || Boolean(protocolFault);
+        if (recycle) {
           void opts.thread.close().catch(() => undefined);
           if (topicThreadId) sessions.delete(topicThreadId);
           // 自愈观测：这里是「kill 中途死」唯一的驱逐点且原先静默——进程死在轮中
@@ -4379,7 +4429,14 @@ export function createOrchestrator(
           // 驱逐发生在哪。
           log.info('agent', 'session-evict', {
             threadId: topicThreadId ?? null,
-            reason: timedOut ? 'watchdog-timeout' : procDead ? 'proc-dead' : 'forced-interrupt',
+            reason: timedOut
+              ? 'watchdog-timeout'
+              : procDead
+                ? 'proc-dead'
+                : protocolFault
+                  ? 'agent-protocol-fault'
+                  : 'forced-interrupt',
+            ...(protocolFault ? { detail: protocolFault } : {}),
           });
         }
 
@@ -4427,6 +4484,7 @@ export function createOrchestrator(
             pushes: st.pushCount,
             cardPushes: st.cardPushes,
             elPushes: st.elPushes,
+            cardRetries: st.retries,
             cardTransportBroken: st.transportBroken,
             rttAvg: st.pushCount ? Math.round(st.totalRttMs / st.pushCount) : 0,
             rttMax: st.maxRttMs,
@@ -4466,7 +4524,7 @@ export function createOrchestrator(
         // whole run — drop any queued follow-ups, but tell the user instead of
         // swallowing them. 优雅 ⏹ 虽然线程留用，但用户按了停就是要停：排队消息
         // 同样丢弃（语义与杀进程路径一致，只是进程不回收）。
-        if (killed || procDead || interrupted) {
+        if (recycle || interrupted) {
           if (state.queue.length > 0) {
             void channel
               .send(
@@ -4475,7 +4533,13 @@ export function createOrchestrator(
                 { replyTo: finalMsgId, replyInThread: !opts.flat },
               )
               .catch(() => undefined);
-            log.info('intake', 'queue-dropped', { depth: state.queue.length, killed, procDead, interrupted });
+            log.info('intake', 'queue-dropped', {
+              depth: state.queue.length,
+              killed,
+              procDead,
+              protocolFault: protocolFault ?? null,
+              interrupted,
+            });
           }
           break;
         }
@@ -4685,7 +4749,16 @@ export function createOrchestrator(
     const ensureCard = async (ctx: GoalTurnCtx): Promise<void> => {
       if (ctx.stream) return;
       const stream = new RunCardStream();
-      const cardMsgId = await stream.create(channel, opts.chatId, buildRunCard(ctx.rc), { replyTo, replyInThread });
+      // Publish the stream before awaiting create(): the goal stop hook can
+      // then cancel an initial message retry even though no cardMsgId exists yet.
+      ctx.stream = stream;
+      pendingCardStreams.add(stream);
+      let cardMsgId: string;
+      try {
+        cardMsgId = await stream.create(channel, opts.chatId, buildRunCard(ctx.rc), { replyTo, replyInThread });
+      } finally {
+        pendingCardStreams.delete(stream);
+      }
       ctx.rc.cardKey = cardMsgId;
       ctx.stream = stream;
       ctx.cardMsgId = cardMsgId;
@@ -4722,6 +4795,9 @@ export function createOrchestrator(
       state.interrupt = () => {
         if (interrupted) return;
         interrupted = true;
+        // If the first visible card is still being created, stop its retry loop
+        // so ⏹ does not wait for the network to recover before ending the goal.
+        if (cur && !cur.cardMsgId) cur.stream?.stopRetries();
         void opts.thread.clearGoal().catch(() => undefined);
         resolveStop();
       };
@@ -4966,7 +5042,10 @@ export function createOrchestrator(
             }, undefined, run.lastActivity);
             for await (const ev of guarded) state = reduce(state, ev);
 
-            if (timedOut) {
+            const protocolFault = thread.needsRecycle?.()
+              ? thread.recycleReason?.() ?? 'Codex 协作状态已失步'
+              : undefined;
+            if (timedOut || protocolFault) {
               const tid = run.turnId();
               // Recycle the thread so the hung turn's never-terminating stream
               // doesn't poison the next comment; the doc resumes from the
@@ -4980,6 +5059,13 @@ export function createOrchestrator(
               void thread.close().catch(() => undefined);
               sessions.delete(sessionKey);
               commentInstrUsed.delete(sessionKey);
+              if (protocolFault) {
+                state = reduce(state, {
+                  type: 'error',
+                  message: `agent 协作状态异常（${protocolFault}），请重试`,
+                  willRetry: false,
+                });
+              }
             } else {
               touchSession(sessionKey); // 轮次收尾打点（M-3 reaper 的空闲时钟）
               await patchSession(sessionKey, { updatedAt: Date.now() });
@@ -4987,7 +5073,13 @@ export function createOrchestrator(
 
             let reply = stripMarkdown(finalMessageText(state)).trim();
             if (state.terminal === 'error' && state.errorMsg) reply = `⚠️ 出错了：${state.errorMsg}`;
-            if (!reply) reply = timedOut ? '（处理超时，请重试或把问题问得更具体些）' : '（没有可回复的内容）';
+            if (!reply) {
+              reply = timedOut
+                ? '（处理超时，请重试或把问题问得更具体些）'
+                : protocolFault
+                  ? `（协作状态异常：${protocolFault}，请重试）`
+                  : '（没有可回复的内容）';
+            }
             if (reply.length > REPLY_MAX_CHARS) reply = `${reply.slice(0, REPLY_MAX_CHARS - 1)}…`;
 
             await postCommentReply(channel, target, evt, reply).catch((err) =>
@@ -5042,16 +5134,26 @@ export function createOrchestrator(
     const live = sessions.get(sessionKey);
     if (live) {
       const alive = live.isAlive();
+      const needsRecycle = live.needsRecycle?.() ?? false;
       // Instructions unchanged + alive → reuse the warm thread (the common case).
-      if (alive && commentInstrUsed.get(sessionKey) === instructions) return live;
+      if (alive && !needsRecycle && commentInstrUsed.get(sessionKey) === instructions) return live;
       // Edited prompt (alive but stale) → close the in-memory thread we're discarding
       // so the resume below re-reads the freshly-synced AGENTS.md/CLAUDE.md. Dead
       // thread → just evict (与 resolveThread 同款守卫；app-server 死后死线程留在缓存，
       // 每次 @ 评论都立即失败)，落进下面的 resume-or-fresh 兜底自愈。
-      if (alive && commentInstrUsed.get(sessionKey) !== instructions) void live.close().catch(() => undefined);
+      if (alive && (needsRecycle || commentInstrUsed.get(sessionKey) !== instructions))
+        void live.close().catch(() => undefined);
       sessions.delete(sessionKey);
       commentInstrUsed.delete(sessionKey);
-      log.info('agent', alive ? 'comment-instr-changed-evict' : 'dead-thread-evict', { sessionKey });
+      if (needsRecycle) {
+        log.info('agent', 'unhealthy-thread-evict', {
+          sessionKey,
+          reason: live.recycleReason?.() ?? 'Codex 协作状态已失步',
+          via: 'comment-resolve',
+        });
+      } else {
+        log.info('agent', alive ? 'comment-instr-changed-evict' : 'dead-thread-evict', { sessionKey });
+      }
     }
     const rec = await getSession(sessionKey);
     if (rec) {
@@ -5351,6 +5453,23 @@ export function createOrchestrator(
     // 已驱逐会话的残留打点顺手清掉，时钟表不随历史会话无限增长。
     for (const key of sessions.keys()) if (!sessionTouchedAt.has(key)) sessionTouchedAt.set(key, now);
     for (const key of [...sessionTouchedAt.keys()]) if (!sessions.has(key)) sessionTouchedAt.delete(key);
+    // A collaboration/tool protocol fault makes a live process unsafe to reuse
+    // even when it has not exited. Reap it as soon as the session is no longer
+    // active; an in-flight run owns the process until its terminal card has been
+    // written, so the active/doc-lock guards prevent mid-turn kills.
+    for (const key of [...sessions.keys()]) {
+      if (active.has(key) || docLocks.has(key)) continue;
+      const thread = sessions.get(key);
+      if (!thread?.needsRecycle?.()) continue;
+      sessions.delete(key);
+      sessionTouchedAt.delete(key);
+      void thread.close().catch(() => undefined);
+      log.info('agent', 'unhealthy-thread-evict', {
+        threadId: key,
+        reason: thread.recycleReason?.() ?? 'Codex 协作状态已失步',
+        via: 'reaper',
+      });
+    }
     const idle = pickIdleSessions(
       sessions.keys(),
       sessionTouchedAt,
@@ -5370,7 +5489,12 @@ export function createOrchestrator(
 
   async function shutdown(): Promise<void> {
     clearInterval(reaper);
+    for (const be of backends.values()) be.stopRetries?.();
     await sessionTitles.shutdown();
+    // CardKit transport retries are intentionally unbounded while the bridge is
+    // alive. Resolve their waits before closing app-server sessions so a network
+    // outage cannot keep the Node process alive during an explicit shutdown.
+    for (const stream of [...runStreams.values(), ...pendingCardStreams]) stream.stopRetries();
     // adopt 失败的孤儿线程已在 launchRun/launchGoalRun 的 finally 就地 close，
     // 这里只需回收 LIVE 会话缓存。
     const live = [...new Set(sessions.values())];

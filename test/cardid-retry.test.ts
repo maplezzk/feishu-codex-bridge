@@ -17,29 +17,41 @@ describe('isCardIdNotReady', () => {
     expect(isCardIdNotReady({ response: { data: { code: 230099 } } })).toBe(true);
     expect(isCardIdNotReady({ response: { data: { msg: 'cardid is invalid' } } })).toBe(true);
   });
-  it('does NOT match genuine errors / network losses (never retries those)', () => {
+  it('does NOT match genuine errors (network losses are retried by the run-card sender)', () => {
     expect(isCardIdNotReady({ response: { data: { code: 99991663, msg: 'rate limited' } } })).toBe(false);
     expect(isCardIdNotReady(new Error('socket hang up'))).toBe(false);
     expect(isCardIdNotReady(undefined)).toBe(false);
   });
 });
 
-/** Minimal fake LarkChannel.rawClient that fails the message-send N times with the
- * propagation transient, then succeeds — to exercise create()'s retry loop. */
-function fakeChannel(failSends: number, sendErr: () => unknown) {
+/** Minimal fake LarkChannel.rawClient that fails the message-send N times with
+ * the supplied error, then succeeds — to exercise create()'s retry loop. */
+function fakeChannel(failSends: number, sendErr: () => unknown, failCreates = 0, createErr = () => new Error('create failed')) {
   let creates = 0;
   let sends = 0;
+  const uuids: string[] = [];
   const ok = { data: { message_id: 'om_ok' } };
   return {
     creates: () => creates,
     sends: () => sends,
+    uuids: () => uuids,
     rawClient: {
-      cardkit: { v1: { card: { create: async () => { creates++; return { data: { card_id: `cs_${creates}` } }; } } } },
+      cardkit: {
+        v1: {
+          card: {
+            create: async () => {
+              creates++;
+              if (creates <= failCreates) throw createErr();
+              return { data: { card_id: `cs_${creates}` } };
+            },
+          },
+        },
+      },
       im: {
         v1: {
           message: {
-            reply: async () => { sends++; if (sends <= failSends) throw sendErr(); return ok; },
-            create: async () => { sends++; if (sends <= failSends) throw sendErr(); return ok; },
+            reply: async (p: any) => { sends++; uuids.push(p?.data?.uuid); if (sends <= failSends) throw sendErr(); return ok; },
+            create: async (p: any) => { sends++; uuids.push(p?.data?.uuid); if (sends <= failSends) throw sendErr(); return ok; },
           },
         },
       },
@@ -64,5 +76,27 @@ describe('RunCardStream.create — cardid-not-ready retry', () => {
     const s = new RunCardStream();
     await expect(s.create(ch, 'oc_1', initial(), {})).rejects.toBeTruthy();
     expect(ch.sends()).toBe(1); // one attempt, no retry
+  });
+
+  it('retries a message transport loss on the same card and same idempotency UUID', async () => {
+    const ch = fakeChannel(1, () => new Error('socket hang up'));
+    const s = new RunCardStream();
+    const mid = await s.create(ch, 'oc_1', initial(), {});
+    expect(mid).toBe('om_ok');
+    expect(ch.creates()).toBe(1); // do not create a second visible card
+    expect(ch.sends()).toBe(2);
+    expect(ch.uuids()[0]).toBeTruthy();
+    expect(ch.uuids()[1]).toBe(ch.uuids()[0]);
+    expect(s.stats().retries).toBe(1);
+  });
+
+  it('retries a card-create transport loss before giving the run a card', async () => {
+    const ch = fakeChannel(0, () => new Error('send should not fail'), 1, () => new Error('getaddrinfo ENOTFOUND open.feishu.cn'));
+    const s = new RunCardStream();
+    const mid = await s.create(ch, 'oc_1', initial(), {});
+    expect(mid).toBe('om_ok');
+    expect(ch.creates()).toBe(2);
+    expect(ch.sends()).toBe(1);
+    expect(s.stats().retries).toBe(1);
   });
 });

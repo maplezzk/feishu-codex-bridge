@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
 import type { CardObject } from './cards';
@@ -32,12 +33,16 @@ const ERR_SEQ_OUT_OF_ORDER = 300317;
  */
 const CHAT_MIN_GAP_MS = 250;
 const RATE_LIMIT_PENALTY_MS = 1_000;
-/** Terminal-frame retry budget when rate-limited (backoff 1s/2s/4s). */
-const TERMINAL_RL_RETRIES = 3;
 const RL_BACKOFF_BASE_MS = 1_000;
-/** A CardKit request must not hold a run's terminal state forever. The SDK's
- * transport has no guaranteed request deadline, so the stream adds one at the
- * last boundary before a card update can block turn cleanup. */
+/** Temporary transport failures (DNS reset, timeout, 5xx) retry forever while
+ * the bridge is alive. Exponential backoff is capped at one minute so a long
+ * outage does not create a tight retry loop. Retries run in the card pump, so
+ * the Codex event consumer never waits on Feishu. */
+const RETRY_BACKOFF_CAP_MS = 60_000;
+const TRANSIENT_BACKOFF_BASE_MS = 500;
+/** The SDK's transport has no guaranteed request deadline, so the stream adds
+ * one at the last boundary before a retry can block on a single CardKit call.
+ * The retry itself may continue until transport recovers or shutdown stops it. */
 export const CARD_API_TIMEOUT_MS = 15_000;
 
 class CardApiTimeoutError extends Error {
@@ -115,8 +120,40 @@ function pacerFor(chatId: string): ChatPacer {
 
 /** Feishu rate limit — HTTP 429 (axios status) or business code 99991400. */
 function isRateLimited(err: unknown): boolean {
-  const e = err as { code?: number; response?: { status?: number; data?: { code?: number } } };
-  return e?.response?.status === 429 || e?.response?.data?.code === 99991400 || e?.code === 99991400;
+  const e = err as { code?: number; status?: number; response?: { status?: number; data?: { code?: number } } };
+  return (e?.response?.status ?? e?.status) === 429 || e?.response?.data?.code === 99991400 || e?.code === 99991400;
+}
+
+/** Network and temporary server failures are safe to retry for a card update:
+ * the request carries a monotonic sequence and the card pump keeps the latest
+ * frame, so a late/duplicate response cannot become a newer baseline. */
+function isTransientCardError(err: unknown): boolean {
+  if (err instanceof CardApiTimeoutError) return true;
+  const e = err as {
+    code?: number | string;
+    message?: string;
+    status?: number;
+    response?: { status?: number; data?: { code?: number } };
+    cause?: { code?: string; message?: string };
+  };
+  const status = e?.response?.status ?? e?.status;
+  if (status === 408 || status === 425 || status === 429 || (typeof status === 'number' && status >= 500)) return true;
+  if (e?.response?.data?.code === 99991400 || e?.code === 99991400) return true;
+  const code = String(e?.code ?? e?.cause?.code ?? '');
+  if (
+    /^(ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNABORTED|EPIPE|EHOSTUNREACH|ENETUNREACH|ERR_NETWORK|UND_ERR_)/i.test(code)
+  ) {
+    return true;
+  }
+  const message = `${e?.message ?? ''} ${e?.cause?.message ?? ''}`;
+  return /(?:network|timed?\s*out|timeout|socket hang up|connection (?:reset|refused|closed)|getaddrinfo|fetch failed|temporarily unavailable)/i.test(
+    message,
+  );
+}
+
+function retryDelayMs(attempt: number, rateLimited: boolean): number {
+  const base = rateLimited ? RL_BACKOFF_BASE_MS : TRANSIENT_BACKOFF_BASE_MS;
+  return Math.min(base * 2 ** attempt, RETRY_BACKOFF_CAP_MS);
 }
 
 /**
@@ -145,6 +182,7 @@ export class RunCardStream {
   private pushCount = 0;
   private cardPushes = 0; // whole-card card.update (structure)
   private elPushes = 0; // element cardElement.content (answer typewriter)
+  private retryCount = 0;
   private totalRttMs = 0;
   private maxRttMs = 0;
   // Coalesced streaming. The consume loop records the latest {card, answerEid} in
@@ -161,10 +199,12 @@ export class RunCardStream {
   private lastAnswerText = '';
   // Per-chat pacer shared with the chat's other streams (set in create()).
   private pacer: ChatPacer | null = null;
-  /** A timed-out CardKit request may still be in flight inside the SDK. Stop
-   * issuing more frames after that point; the caller will send the textual
-   * completion/error fallback and the late request cannot keep the run alive. */
+  /** A CardKit request may remain in flight inside the SDK after its local
+   * timeout. `stopRetries()` is used by bridge shutdown to release an otherwise
+   * infinite retry loop; normal transient failures keep retrying forever. */
   private transportBroken = false;
+  private retryStopped = false;
+  private readonly retryWaiters = new Set<() => void>();
   // Forced whole-card writes (button/settings repaint, queue → run flip,
   // terminal frame) must never race one another. In particular, an async
   // completion-reminder repaint that started just before turn completion must
@@ -185,6 +225,7 @@ export class RunCardStream {
     pushCount: number;
     cardPushes: number;
     elPushes: number;
+    retries: number;
     totalRttMs: number;
     maxRttMs: number;
     transportBroken: boolean;
@@ -193,10 +234,42 @@ export class RunCardStream {
       pushCount: this.pushCount,
       cardPushes: this.cardPushes,
       elPushes: this.elPushes,
+      retries: this.retryCount,
       totalRttMs: this.totalRttMs,
       maxRttMs: this.maxRttMs,
       transportBroken: this.transportBroken,
     };
+  }
+
+  /** Stop background retries during bridge shutdown or a test teardown. A
+   * normal Feishu outage never calls this; transient frames keep retrying until
+   * they land or the process is explicitly stopped. `markTransportBroken=false`
+   * is used by queue cancellation so its final cancelled repaint may still be
+   * attempted once after the retry wait is cancelled. */
+  stopRetries(markTransportBroken = true): void {
+    if (this.retryStopped) return;
+    this.retryStopped = true;
+    this.pending = null;
+    if (markTransportBroken) {
+      this.transportBroken = true;
+    }
+    for (const wake of [...this.retryWaiters]) wake();
+  }
+
+  private async waitRetry(ms: number): Promise<void> {
+    if (this.retryStopped) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.retryWaiters.delete(finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      this.retryWaiters.add(finish);
+    });
   }
 
   /**
@@ -206,6 +279,7 @@ export class RunCardStream {
    * event-consume loop instead of awaiting {@link streamCard} per event.
    */
   streamCoalesced(channel: LarkChannel, fullCard: CardObject, answerEid: string | null): void {
+    if (this.retryStopped) return;
     this.pending = { card: fullCard, answerEid };
     this.pumpChannel = channel;
     if (!this.pumpPromise) this.pumpPromise = this.pump();
@@ -280,47 +354,69 @@ export class RunCardStream {
       );
     await this.pacer?.wait();
     if (this.transportBroken) return false;
-    const t0 = Date.now();
-    try {
-      try {
-        await push();
-      } catch (err) {
-        const code = cardkitErrCode(err);
-        if (code === ERR_STREAMING_OFF) {
-          log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, reopenStreaming: true });
-          await withCardApiTimeout(
-            () =>
-              channel.rawClient.cardkit.v1.card.settings({
-                path: { card_id: this.cardId },
-                data: {
-                  settings: JSON.stringify({ config: { streaming_mode: true } }),
-                  sequence: ++this.seq,
-                  uuid: `o_${this.cardId}_${this.seq}`,
-                },
-              }),
-            '流式设置更新',
-          );
-          await push();
-        } else if (code === ERR_SEQ_OUT_OF_ORDER) {
-          log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, retry: true });
-          await push();
-        } else {
-          throw err;
-        }
-      }
-      const rtt = Date.now() - t0;
-      this.pushCount++;
-      this.elPushes++;
-      this.totalRttMs += rtt;
-      if (rtt > this.maxRttMs) this.maxRttMs = rtt;
-      return true;
-    } catch (err) {
-      this.markTransportBroken(err, 'run-stream-el');
+    for (let attempt = 0; ; attempt++) {
       if (this.transportBroken) return false;
-      const rl = isRateLimited(err);
-      if (rl) this.pacer?.penalize();
-      log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, rateLimited: rl });
-      return false;
+      const t0 = Date.now();
+      try {
+        try {
+          await push();
+        } catch (err) {
+          const code = cardkitErrCode(err);
+          if (code === ERR_STREAMING_OFF) {
+            log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, reopenStreaming: true });
+            await withCardApiTimeout(
+              () =>
+                channel.rawClient.cardkit.v1.card.settings({
+                  path: { card_id: this.cardId },
+                  data: {
+                    settings: JSON.stringify({ config: { streaming_mode: true } }),
+                    sequence: ++this.seq,
+                    uuid: `o_${this.cardId}_${this.seq}`,
+                  },
+                }),
+              '流式设置更新',
+            );
+            await push();
+          } else if (code === ERR_SEQ_OUT_OF_ORDER) {
+            log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, retry: true });
+            await push();
+          } else {
+            throw err;
+          }
+        }
+        if (this.transportBroken) return false;
+        const rtt = Date.now() - t0;
+        this.pushCount++;
+        this.elPushes++;
+        this.totalRttMs += rtt;
+        if (rtt > this.maxRttMs) this.maxRttMs = rtt;
+        return true;
+      } catch (err) {
+        const rl = isRateLimited(err);
+        const retryable =
+          rl ||
+          isTransientCardError(err) ||
+          cardkitErrCode(err) === ERR_STREAMING_OFF ||
+          cardkitErrCode(err) === ERR_SEQ_OUT_OF_ORDER;
+        if (retryable) {
+          this.retryCount++;
+          if (rl) this.pacer?.penalize();
+          log.fail('card', err, {
+            phase: 'run-stream-el',
+            cardId: this.cardId,
+            seq: this.seq,
+            retry: true,
+            attempt,
+            rateLimited: rl,
+          });
+          await this.waitRetry(retryDelayMs(attempt, rl));
+          if (this.retryStopped) return false;
+          continue;
+        }
+        if (rl) this.pacer?.penalize();
+        log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, rateLimited: rl });
+        return false;
+      }
     }
   }
 
@@ -330,11 +426,10 @@ export class RunCardStream {
    * A just-created CardKit entity occasionally hasn't propagated when the message
    * referencing it is sent — Feishu 400s with 230099 / ErrCode 11310 "cardid is
    * invalid" and the run card silently fails to appear (this surfaced as
-   * intermittent intake.fail). Same transient, same fix as
-   * {@link ../card/managed#sendManagedCard}: retry the whole create+send with a
-   * short backoff. Only this transient retries — Feishu rejected the message
-   * outright (nothing sent), and a re-created entity that's never referenced is a
-   * harmless orphan, so no duplicate card. */
+   * intermittent intake.fail). The 11310 propagation error recreates the entity;
+   * network/timeout/rate-limit failures retry the message with a stable Feishu
+   * idempotency UUID, keeping the already-created entity so an accepted request
+   * whose response was lost cannot create a duplicate visible card. */
   async create(
     channel: LarkChannel,
     chatId: string,
@@ -342,57 +437,86 @@ export class RunCardStream {
     opts: { replyTo?: string; replyInThread?: boolean },
   ): Promise<string> {
     this.pacer = pacerFor(chatId); // shared with the chat's other streams
-    const attempt = async (): Promise<string> => {
-      const created = await withCardApiTimeout(
-        () =>
-          channel.rawClient.cardkit.v1.card.create({
-            data: { type: 'card_json', data: JSON.stringify(initialCard) },
-          }),
-        '创建',
-      );
-      const cardId = (created as { data?: { card_id?: string } }).data?.card_id;
-      if (!cardId) {
-        throw new Error(`cardkit.card.create returned no card_id: ${JSON.stringify(created).slice(0, 200)}`);
-      }
-      this.cardId = cardId;
-      this.lastContent = JSON.stringify(initialCard);
-
-      const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
-      let messageId: string | undefined;
-      if (opts.replyTo) {
-        const replyTo = opts.replyTo;
-        const r = await withCardApiTimeout(
-          () =>
-            channel.rawClient.im.v1.message.reply({
-              path: { message_id: replyTo },
-              data: { msg_type: 'interactive', content, reply_in_thread: opts.replyInThread ?? false },
-            }),
-          '发送',
-        );
-        messageId = (r as { data?: { message_id?: string } }).data?.message_id;
-      } else {
-        const r = await withCardApiTimeout(
-          () =>
-            channel.rawClient.im.v1.message.create({
-              params: { receive_id_type: 'chat_id' },
-              data: { receive_id: chatId, msg_type: 'interactive', content },
-            }),
-          '发送',
-        );
-        messageId = (r as { data?: { message_id?: string } }).data?.message_id;
-      }
-      if (!messageId) throw new Error('run card send returned no message_id');
-      this._messageId = messageId;
-      return messageId;
-    };
-
+    // Feishu's message create/reply accepts a caller UUID and deduplicates the
+    // same request for one hour. Keep it stable across retries: if the first
+    // request reached Feishu but its response was lost, the retry returns the
+    // existing message instead of posting a second visible card. CardKit card
+    // entities have no equivalent idempotency field, so only recreate the entity
+    // for the explicit 11310 propagation error; transport errors keep using the
+    // same already-created card id.
+    const messageUuid = randomUUID();
+    let cardId: string | undefined;
     for (let i = 0; ; i++) {
+      if (this.retryStopped) throw new Error('card retry stopped');
       try {
-        return await attempt();
+        if (!cardId) {
+          const created = await withCardApiTimeout(
+            () =>
+              channel.rawClient.cardkit.v1.card.create({
+                data: { type: 'card_json', data: JSON.stringify(initialCard) },
+              }),
+            '创建',
+          );
+          cardId = (created as { data?: { card_id?: string } }).data?.card_id;
+          if (!cardId) {
+            throw new Error(`cardkit.card.create returned no card_id: ${JSON.stringify(created).slice(0, 200)}`);
+          }
+          this.cardId = cardId;
+          this.lastContent = JSON.stringify(initialCard);
+        }
+
+        const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+        let messageId: string | undefined;
+        if (opts.replyTo) {
+          const replyTo = opts.replyTo;
+          const r = await withCardApiTimeout(
+            () =>
+              channel.rawClient.im.v1.message.reply({
+                path: { message_id: replyTo },
+                data: {
+                  msg_type: 'interactive',
+                  content,
+                  reply_in_thread: opts.replyInThread ?? false,
+                  uuid: messageUuid,
+                },
+              }),
+            '发送',
+          );
+          messageId = (r as { data?: { message_id?: string } }).data?.message_id;
+        } else {
+          const r = await withCardApiTimeout(
+            () =>
+              channel.rawClient.im.v1.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: { receive_id: chatId, msg_type: 'interactive', content, uuid: messageUuid },
+              }),
+            '发送',
+          );
+          messageId = (r as { data?: { message_id?: string } }).data?.message_id;
+        }
+        if (!messageId) throw new Error('run card send returned no message_id');
+        this._messageId = messageId;
+        return messageId;
       } catch (err) {
-        if (i >= 2 || !isCardIdNotReady(err)) throw err;
-        log.fail('card', err, { phase: 'run-stream-create', attempt: i, retry: true });
-        await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+        const cardIdNotReady = isCardIdNotReady(err);
+        const transient = isTransientCardError(err);
+        if (!cardIdNotReady && !transient) throw err;
+        if (cardIdNotReady) {
+          // Feishu explicitly rejected the reference before sending a message;
+          // recreate the entity and try the same idempotent message request.
+          cardId = undefined;
+          this.cardId = '';
+          this.lastContent = '';
+        }
+        this.retryCount++;
+        log.fail('card', err, {
+          phase: 'run-stream-create',
+          attempt: i,
+          retry: true,
+          cardIdNotReady,
+          rateLimited: isRateLimited(err),
+        });
+        await this.waitRetry(retryDelayMs(i, isRateLimited(err)));
       }
     }
   }
@@ -411,30 +535,46 @@ export class RunCardStream {
     this.lastPush = now;
     await this.pacer?.wait();
     if (this.transportBroken) return false;
-    const t0 = Date.now();
-    try {
-      await withCardApiTimeout(
-        () =>
-          channel.rawClient.cardkit.v1.card.update({
-            path: { card_id: this.cardId },
-            data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
-          }),
-        '流式更新',
-      );
-      this.lastContent = data;
-      const rtt = Date.now() - t0;
-      this.pushCount++;
-      this.cardPushes++;
-      this.totalRttMs += rtt;
-      if (rtt > this.maxRttMs) this.maxRttMs = rtt;
-      return true;
-    } catch (err) {
-      this.markTransportBroken(err, 'run-stream');
+    for (let attempt = 0; ; attempt++) {
       if (this.transportBroken) return false;
-      const rl = isRateLimited(err);
-      if (rl) this.pacer?.penalize();
-      log.fail('card', err, { phase: 'run-stream', cardId: this.cardId, seq: this.seq, rateLimited: rl });
-      return false;
+      const t0 = Date.now();
+      try {
+        await withCardApiTimeout(
+          () =>
+            channel.rawClient.cardkit.v1.card.update({
+              path: { card_id: this.cardId },
+              data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
+            }),
+          '流式更新',
+        );
+        if (this.transportBroken) return false;
+        this.lastContent = data;
+        const rtt = Date.now() - t0;
+        this.pushCount++;
+        this.cardPushes++;
+        this.totalRttMs += rtt;
+        if (rtt > this.maxRttMs) this.maxRttMs = rtt;
+        return true;
+      } catch (err) {
+        const rl = isRateLimited(err);
+        if (rl || isTransientCardError(err)) {
+          this.retryCount++;
+          if (rl) this.pacer?.penalize();
+          log.fail('card', err, {
+            phase: 'run-stream',
+            cardId: this.cardId,
+            seq: this.seq,
+            retry: true,
+            attempt,
+            rateLimited: rl,
+          });
+          await this.waitRetry(retryDelayMs(attempt, rl));
+          if (this.retryStopped) return false;
+          continue;
+        }
+        log.fail('card', err, { phase: 'run-stream', cardId: this.cardId, seq: this.seq, rateLimited: rl });
+        return false;
+      }
     }
   }
 
@@ -445,12 +585,13 @@ export class RunCardStream {
    *
    * The terminal frame MUST land — losing it leaves the card "streaming"
    * forever (cursor + dead ⏹) while the run is over and `runsByCard` already
-   * cleared (audit-02 F7). So failures retry: rate limits (429 / 99991400)
-   * with exponential backoff (1s/2s/4s, {@link TERMINAL_RL_RETRIES} retries);
-   * anything else — typically 200810 "card in ongoing interaction" when the
-   * update fires inside a ⏹ click's 3s window — waits out the window and
-   * retries once. Returns whether the requested frame is observably on the
-   * entity, so terminal callers can emit a truthful fallback notification. */
+   * cleared (audit-02 F7). Rate limits (429 / 99991400) and temporary
+   * network/5xx/timeout failures retry forever with exponential backoff capped
+   * at one minute; anything else — typically 200810 "card in ongoing
+   * interaction" when the update fires inside a ⏹ click's 3s window — waits out
+   * the window and retries once. Returns whether the requested frame is
+   * observably on the entity, so terminal callers can emit a truthful fallback
+   * notification. */
   updateCard(channel: LarkChannel, fullCard: CardObject): Promise<boolean> {
     return this.enqueueForcedUpdate(channel, fullCard);
   }
@@ -512,34 +653,46 @@ export class RunCardStream {
       if (this.transportBroken) return false;
       try {
         await push();
+        if (this.transportBroken) return false;
         return true;
       } catch (err) {
-        this.markTransportBroken(err, 'run-update');
-        if (this.transportBroken) return false;
         const rl = isRateLimited(err);
         if (rl) this.pacer?.penalize();
-        if (i >= (rl ? TERMINAL_RL_RETRIES : 1)) {
+        const transient = isTransientCardError(err);
+        const retryable = rl || transient;
+        if (retryable) {
+          log.fail('card', err, {
+            phase: 'run-update',
+            cardId: this.cardId,
+            seq: this.seq,
+            retry: true,
+            attempt: i,
+            rateLimited: rl,
+          });
+          this.retryCount++;
+          await this.waitRetry(retryDelayMs(i, rl));
+          if (this.retryStopped) return false;
+          continue;
+        }
+        if (i >= 1) {
           log.fail('card', err, { phase: 'run-update-retry', cardId: this.cardId, seq: this.seq });
           return false;
         }
-        log.fail('card', err, { phase: 'run-update', cardId: this.cardId, seq: this.seq, retry: true, rateLimited: rl });
-        await new Promise((r) => setTimeout(r, rl ? RL_BACKOFF_BASE_MS * 2 ** i : 3200));
+        log.fail('card', err, {
+          phase: 'run-update',
+          cardId: this.cardId,
+          seq: this.seq,
+          retry: true,
+          attempt: i,
+          rateLimited: rl,
+        });
+        this.retryCount++;
+        await this.waitRetry(3200);
+        if (this.retryStopped) return false;
       }
     }
   }
 
-  private markTransportBroken(err: unknown, phase: string): void {
-    if (!(err instanceof CardApiTimeoutError)) return;
-    this.transportBroken = true;
-    this.pending = null;
-    log.warn('card', 'transport-timeout', {
-      phase,
-      cardId: this.cardId,
-      seq: this.seq,
-      timeoutMs: CARD_API_TIMEOUT_MS,
-      message: err.message,
-    });
-  }
 }
 
 type CardBody = { body?: { elements?: Array<Record<string, unknown>> } };
