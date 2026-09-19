@@ -59,6 +59,13 @@ export interface InteractiveCardContent {
   reason?: InteractiveCardReadReason;
 }
 
+interface RawCardMessageItem {
+  message_id?: string;
+  body?: { content?: string };
+  /** Some batch-response wrappers expose the compact content at the item root. */
+  content?: string;
+}
+
 /**
  * Extract readable text + links from the `raw_card_content` (json_card) schema —
  * the property-wrapped card-builder format where text lives in
@@ -283,7 +290,18 @@ export async function fetchInteractiveCardContent(
   channel: LarkChannel,
   messageId: string,
 ): Promise<InteractiveCardContent> {
+  // `message.get` is the SDK's documented single-message endpoint, but for
+  // Card 2.0 it can still return only the title even when the bot can read the
+  // complete card.  The batch detail endpoint is what Feishu's own message
+  // tooling uses for raw card content and returns the full table/body.
+  const batch = await fetchRawCardFromBatch(channel, messageId);
+  if (batch?.complete) {
+    log.info('intake', 'card-content-mget-enriched', { messageId, len: batch.text?.length ?? 0 });
+    return batch;
+  }
+
   let body: string | undefined;
+  let direct: InteractiveCardContent;
   try {
     const res = await channel.rawClient.im.v1.message.get({
       path: { message_id: messageId },
@@ -292,10 +310,56 @@ export async function fetchInteractiveCardContent(
     body = (res.data as { items?: { body?: { content?: string } }[] } | undefined)?.items?.[0]?.body?.content;
   } catch (err) {
     log.warn('intake', 'card-content-fetch-failed', { messageId, err: String(err) });
-    return { complete: false, reason: 'fetch-failed' };
+    direct = { complete: false, reason: 'fetch-failed' };
+    return preferCardReadResult(batch, direct);
   }
-  if (!body) return { complete: false, reason: 'empty-response' };
+  if (!body) {
+    direct = { complete: false, reason: 'empty-response' };
+    return preferCardReadResult(batch, direct);
+  }
   const card = parseRawCardWrapper(body);
-  if (card == null) return { complete: false, reason: 'malformed-response' };
-  return assessRawCardContent(card);
+  if (card == null) {
+    direct = { complete: false, reason: 'malformed-response' };
+    return preferCardReadResult(batch, direct);
+  }
+  direct = assessRawCardContent(card);
+  return preferCardReadResult(batch, direct);
+}
+
+/** Fetch raw card content through the batch detail endpoint. */
+async function fetchRawCardFromBatch(channel: LarkChannel, messageId: string): Promise<InteractiveCardContent | undefined> {
+  const request = (channel.rawClient as unknown as { request?: (payload: unknown) => Promise<unknown> }).request;
+  if (typeof request !== 'function') return undefined;
+  try {
+    const response = (await request.call(channel.rawClient, {
+      method: 'GET',
+      url: '/open-apis/im/v1/messages/mget',
+      params: {
+        card_msg_content_type: 'raw_card_content',
+        with_sender_name: 'true',
+        message_ids: messageId,
+      },
+    })) as { data?: unknown } | undefined;
+    const payload = response?.data as Record<string, unknown> | undefined;
+    const nested = payload?.data as Record<string, unknown> | undefined;
+    const items = (payload?.items ?? payload?.messages ?? nested?.items ?? nested?.messages) as unknown;
+    if (!Array.isArray(items)) return undefined;
+    const item = (items as RawCardMessageItem[]).find((entry) => !entry.message_id || entry.message_id === messageId);
+    const body = item?.body?.content ?? item?.content;
+    if (typeof body !== 'string' || !body.trim()) return { complete: false, reason: 'empty-response' };
+    const card = parseRawCardWrapper(body);
+    return card == null ? { complete: false, reason: 'malformed-response' } : assessRawCardContent(card);
+  } catch (err) {
+    log.warn('intake', 'card-content-mget-failed', { messageId, err: String(err) });
+    return undefined;
+  }
+}
+
+/** Prefer a batch result when it contains more information than the SDK call. */
+function preferCardReadResult(batch: InteractiveCardContent | undefined, direct: InteractiveCardContent): InteractiveCardContent {
+  if (!batch) return direct;
+  if (batch.complete) return batch;
+  if (!direct.text) return batch;
+  if (batch.text && batch.text.length > direct.text.length) return batch;
+  return direct;
 }

@@ -254,6 +254,39 @@ describe('assessRawCardContent / fetchInteractiveCardContent', () => {
     await expect(fetchInteractiveCardContent(ch, 'om_card')).resolves.toEqual({ complete: false, reason: 'fetch-failed' });
   });
 
+  it('uses the batch message-detail endpoint when message.get only returns a title', async () => {
+    const titleOnly = JSON.stringify({ json_card: JSON.stringify({ header: { title: { tag: 'plain_text', content: 'WMS 告警' } } }) });
+    const full = JSON.stringify({ json_card: JSON.stringify({
+      header: { title: { tag: 'plain_text', content: 'WMS 告警' } },
+      body: { elements: [{ tag: 'markdown', content: 'container_id: 10120' }] },
+    }) });
+    const calls: unknown[] = [];
+    const ch = {
+      rawClient: {
+        im: { v1: { message: { get: async () => ({ data: { items: [{ body: { content: titleOnly } }] } }) } } },
+        request: async (payload: unknown) => {
+          calls.push(payload);
+          return { data: { items: [{ message_id: 'om_card', body: { content: full } }] } };
+        },
+      },
+    } as unknown as LarkChannel;
+
+    const result = await fetchInteractiveCardContent(ch, 'om_card');
+    expect(result.complete).toBe(true);
+    expect(result.text).toContain('container_id: 10120');
+    expect(calls).toEqual([
+      {
+        method: 'GET',
+        url: '/open-apis/im/v1/messages/mget',
+        params: {
+          card_msg_content_type: 'raw_card_content',
+          with_sender_name: 'true',
+          message_ids: 'om_card',
+        },
+      },
+    ]);
+  });
+
   it('detects a normalized one-line card title as a risky degraded input', () => {
     expect(isLikelyIncompleteCardText('SLS 报警')).toBe(true);
     expect(isLikelyIncompleteCardText('环境\n生产')).toBe(false);
