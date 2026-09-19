@@ -227,6 +227,12 @@ export interface AgentThread {
    * the thread is unusable and must be evicted from the live cache so
    * resolveThread's resume fallback can take over. */
   isAlive(): boolean;
+  /** Optional backend health signal. A process can stay alive while Codex's
+   * collaboration/tool registry is poisoned; callers should recycle it before
+   * the next turn when this returns true. */
+  needsRecycle?(): boolean;
+  /** Optional diagnostic reason paired with {@link needsRecycle}. */
+  recycleReason?(): string | undefined;
   /** terminate the underlying app-server process */
   close(): Promise<void>;
 }
@@ -430,4 +436,6 @@ export interface AgentBackend {
   generateSessionTitle?(opts: GenerateSessionTitleOptions): Promise<string | undefined>;
   startThread(opts: StartThreadOptions): Promise<AgentThread>;
   resumeThread(opts: ResumeThreadOptions): Promise<AgentThread>;
+  /** Stop an in-flight backend retry loop during an explicit bridge shutdown. */
+  stopRetries?(): void;
 }

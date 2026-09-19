@@ -103,6 +103,13 @@ const READ_HISTORY_TIMEOUT_MS = 20_000;
  * codex can't hang the "压缩中" card forever. */
 const COMPACT_TIMEOUT_MS = 120_000;
 
+/** Session control RPCs are safe to retry before a turn is started. Each attempt
+ * has a 20s deadline; a transient network failure keeps retrying with exponential
+ * backoff capped at one minute, while every failed process is closed first. */
+const THREAD_CONTROL_TIMEOUT_MS = 20_000;
+const THREAD_CONTROL_BACKOFF_MS = 500;
+const THREAD_CONTROL_RETRY_CAP_MS = 60_000;
+
 /** Keep the auxiliary title turn bounded. This mirrors Codex App's short-lived
  * background title job; the dedicated app-server process is always closed in a
  * finally block, so a wedged model request cannot leave an orphan behind. */
@@ -270,6 +277,51 @@ function withTitleDeadline<T>(work: Promise<T>, timeoutMs = TITLE_GENERATION_TIM
   });
 }
 
+function withDeadline<T>(work: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Only retry failures that indicate a transport or temporary upstream outage.
+ * Business errors such as an unknown session id must fall through immediately
+ * so the caller can take its normal resume/recreate path. */
+function isTransientAgentError(err: unknown): boolean {
+  const e = err as {
+    code?: number | string;
+    message?: string;
+    status?: number;
+    response?: { status?: number; data?: { code?: number } };
+    cause?: { code?: string; message?: string };
+  };
+  const status = e?.response?.status ?? e?.status;
+  if (status === 408 || status === 425 || status === 429 || (typeof status === 'number' && status >= 500)) return true;
+  const code = String(e?.code ?? e?.cause?.code ?? '');
+  if (
+    /^(ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNABORTED|EPIPE|EHOSTUNREACH|ENETUNREACH|ERR_NETWORK|UND_ERR_)/i.test(code)
+  ) {
+    return true;
+  }
+  const message = `${e?.message ?? ''} ${e?.cause?.message ?? ''}`;
+  return /(?:network|timed?\s*out|timeout|connection (?:reset|refused|closed)|socket hang up|getaddrinfo|fetch failed|temporarily unavailable|service unavailable|upstream)/i.test(
+    message,
+  );
+}
+
+function threadRetryDelayMs(attempt: number): number {
+  return Math.min(THREAD_CONTROL_BACKOFF_MS * 2 ** attempt, THREAD_CONTROL_RETRY_CAP_MS);
+}
+
 class CodexThread implements AgentThread {
   private currentTurnId: string | undefined;
 
@@ -304,34 +356,55 @@ class CodexThread implements AgentThread {
     // The caller owns the new failure mode (card setup throws after the turn
     // started): launchRun aborts+closes the thread on that path.
     //
-    // turn/start stays in flight for the whole turn (events arrive via
-    // notifications), so we can't await it up front. But if it *rejects* —
-    // bad params, thread gone, auth failure — codex emits no notification
-    // that maps to done/error, so the stream loop below would block until the
-    // idle watchdog fires and the user sees a bogus "已超时" instead of the
-    // real cause. Race the rejection against the stream and surface it. (A
-    // clean child exit closes the stream on its own, ending the loop.)
-    let startError: Error | undefined;
-    const startFailed: Promise<'start-failed'> = new Promise((resolve) => {
-      self.client.request('turn/start', params).then(undefined, (err: unknown) => {
-        startError = err instanceof Error ? err : new Error(String(err));
-        log.fail('agent', startError, { phase: 'turn/start' });
-        resolve('start-failed');
-      });
-    });
+    // The RPC response identifies OUR turn. Resume/goal notifications can still
+    // be buffered here; accepting their completion would close the new card.
+    // Observe rejection immediately even when card setup delays consumption.
+    const started = self.client.request<{ turn: { id: string } }>('turn/start', params)
+      .then(
+        (response) => ({ response, error: undefined }),
+        (error: unknown) => ({ response: undefined, error: error instanceof Error ? error : new Error(String(error)) }),
+      );
     async function* gen(): AsyncGenerator<AgentEvent> {
-      const stream = self.client.stream()[Symbol.asyncIterator]();
-      while (true) {
-        const step = await Promise.race([stream.next(), startFailed]);
-        if (step === 'start-failed') {
-          yield { type: 'error', message: startError?.message ?? 'turn/start 请求失败', willRetry: false };
-          return;
-        }
-        if (step.done) return;
+      const result = await started;
+      if (result.error || !result.response?.turn?.id) {
+        const error = result.error ?? new Error('turn/start response is missing turn.id');
+        log.fail('agent', error, { phase: 'turn/start', sessionId: self.sessionId });
+        yield { type: 'error', message: error.message, willRetry: false };
+        return;
+      }
+      const turnId = result.response.turn.id;
+      self.currentTurnId = turnId;
+      log.info('agent', 'turn-bound', { sessionId: self.sessionId, turnId });
+      for await (const notification of self.client.stream()) {
+        const scope = notification.params as { threadId?: string; turnId?: string; turn?: { id: string } };
+        const eventTurnId = scope.turnId ?? scope.turn?.id;
+        // One app-server client is dedicated to this parent thread. Codex
+        // subagents are represented by child thread/turn ids on that same
+        // connection, so every raw notification from the client is evidence of
+        // liveness even when it is not part of the parent's rendered stream.
+        // Updating before the scope filter prevents a busy child from looking
+        // idle to the bridge watchdog and getting killed while it is working.
         lastActivityAt = Date.now();
-        const ev = mapNotification(step.value);
+        if ((scope.threadId && scope.threadId !== self.sessionId) ||
+            (eventTurnId && eventTurnId !== turnId)) {
+          if (notification.method === 'turn/completed' || notification.method === 'turn/started') {
+            log.info('agent', 'turn-event-ignored', {
+              sessionId: self.sessionId, turnId, eventThreadId: scope.threadId,
+              eventTurnId, method: notification.method,
+            });
+            if (eventTurnId && eventTurnId !== turnId) {
+              log.info('agent', 'subagent-activity', {
+                sessionId: self.sessionId,
+                parentTurnId: turnId,
+                childTurnId: eventTurnId,
+                method: notification.method,
+              });
+            }
+          }
+          continue;
+        }
+        const ev = mapNotification(notification);
         if (!ev) continue;
-        if (ev.type === 'turn_started') self.currentTurnId = ev.turnId;
         yield ev;
         if (ev.type === 'done') return;
         if (ev.type === 'error' && !ev.willRetry) return;
@@ -494,12 +567,23 @@ class CodexThread implements AgentThread {
     return !this.client.exited;
   }
 
+  needsRecycle(): boolean {
+    return this.client.needsRecycle;
+  }
+
+  recycleReason(): string | undefined {
+    return this.client.recycleReason;
+  }
+
   async close(): Promise<void> {
     await this.client.close();
   }
 }
 
 export class CodexAppServerBackend implements AgentBackend {
+  private retryStopped = false;
+  private readonly retryWaiters = new Set<() => void>();
+
   readonly id = 'codex-appserver';
   readonly displayName = 'Codex (app-server)';
   private modelCache: ModelInfo[] | null = null;
@@ -644,29 +728,93 @@ export class CodexAppServerBackend implements AgentBackend {
     // Build sandbox params first — the platform fail-closed guard throws here,
     // before we spawn, so a rejected tier leaves no orphan app-server process.
     const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
-    const client = await this.spawn(opts.cwd);
-    const res = await client.request<{ thread: { id: string } }>('thread/start', {
-      cwd: opts.cwd,
-      approvalPolicy: APPROVAL_POLICY,
-      ...sandbox,
-      developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
-      ...(opts.model ? { model: opts.model } : {}),
-    });
-    return new CodexThread(client, res.thread.id, opts.model, opts.effort);
+    for (let attempt = 0; ; attempt++) {
+      if (this.retryStopped) throw new Error('agent retry stopped');
+      let client: AppServerClient | undefined;
+      try {
+        client = await this.spawn(opts.cwd);
+        const res = await withDeadline(
+          client.request<{ thread: { id: string } }>('thread/start', {
+            cwd: opts.cwd,
+            approvalPolicy: APPROVAL_POLICY,
+            ...sandbox,
+            developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
+            ...(opts.model ? { model: opts.model } : {}),
+          }),
+          THREAD_CONTROL_TIMEOUT_MS,
+          'thread/start',
+        );
+        if (this.retryStopped) {
+          await client.close().catch(() => undefined);
+          throw new Error('agent retry stopped');
+        }
+        return new CodexThread(client, res.thread.id, opts.model, opts.effort);
+      } catch (err) {
+        // The client may have sent a request successfully and then lost the
+        // response. Closing it before retrying prevents a late response or a
+        // half-initialized app-server from contaminating the next session.
+        await client?.close().catch(() => undefined);
+        if (this.retryStopped || !isTransientAgentError(err)) throw err;
+        log.fail('agent', err, { phase: 'thread/start', attempt, retry: true });
+        await this.waitRetry(threadRetryDelayMs(attempt));
+      }
+    }
   }
 
   async resumeThread(opts: ResumeThreadOptions): Promise<AgentThread> {
     const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
-    const client = await this.spawn(opts.cwd);
-    const res = await client.request<{ thread: { id: string } }>('thread/resume', {
-      threadId: opts.sessionId,
-      cwd: opts.cwd,
-      approvalPolicy: APPROVAL_POLICY,
-      ...sandbox,
-      developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
-      ...(opts.model ? { model: opts.model } : {}),
+    for (let attempt = 0; ; attempt++) {
+      if (this.retryStopped) throw new Error('agent retry stopped');
+      let client: AppServerClient | undefined;
+      try {
+        client = await this.spawn(opts.cwd);
+        const res = await withDeadline(
+          client.request<{ thread: { id: string } }>('thread/resume', {
+            threadId: opts.sessionId,
+            cwd: opts.cwd,
+            approvalPolicy: APPROVAL_POLICY,
+            ...sandbox,
+            developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
+            ...(opts.model ? { model: opts.model } : {}),
+          }),
+          THREAD_CONTROL_TIMEOUT_MS,
+          'thread/resume',
+        );
+        if (this.retryStopped) {
+          await client.close().catch(() => undefined);
+          throw new Error('agent retry stopped');
+        }
+        return new CodexThread(client, res.thread.id, opts.model, opts.effort);
+      } catch (err) {
+        await client?.close().catch(() => undefined);
+        if (this.retryStopped || !isTransientAgentError(err)) throw err;
+        log.fail('agent', err, { phase: 'thread/resume', attempt, retry: true });
+        await this.waitRetry(threadRetryDelayMs(attempt));
+      }
+    }
+  }
+
+  /** Stop retry delays without waiting for their one-minute cap to expire. */
+  stopRetries(): void {
+    if (this.retryStopped) return;
+    this.retryStopped = true;
+    for (const wake of [...this.retryWaiters]) wake();
+  }
+
+  private async waitRetry(ms: number): Promise<void> {
+    if (this.retryStopped) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.retryWaiters.delete(finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      this.retryWaiters.add(finish);
     });
-    return new CodexThread(client, res.thread.id, opts.model, opts.effort);
   }
 
   private async spawn(cwd: string): Promise<AppServerClient> {
@@ -679,8 +827,17 @@ export class CodexAppServerBackend implements AgentBackend {
     void refillWarmPool();
     if (warmed) return warmed;
     const client = new AppServerClient({ bin, cwd });
-    await client.connect();
-    return client;
+    try {
+      // A cold app-server can start successfully and still wedge during the
+      // initialize handshake (for example while its network/auth setup is
+      // reconnecting). Bound that phase too; startThread/resumeThread will
+      // classify the timeout and retry with a fresh process.
+      await withDeadline(client.connect(), THREAD_CONTROL_TIMEOUT_MS, 'app-server initialize');
+      return client;
+    } catch (err) {
+      await client.close().catch(() => undefined);
+      throw err;
+    }
   }
 }
 

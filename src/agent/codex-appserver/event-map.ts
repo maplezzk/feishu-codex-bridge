@@ -14,6 +14,69 @@ const DIFF_MAX = 1200;
  * trailing segments (`…/dir/file.ts`) so the tool title stays one line. */
 const PATH_TAIL_MAX = 40;
 
+/** Keep collaboration calls visible in the run card. Codex reports the parent
+ * tool call as a `collabAgentToolCall` item; the child turns themselves are
+ * intentionally filtered by the backend because they have a different turn id.
+ * Rendering this parent item gives the user a truthful progress marker instead
+ * of a blank card while a child is running. */
+const COLLAB_TOOL_LABELS: Record<string, string> = {
+  spawnAgent: '启动子任务',
+  sendInput: '发送子任务消息',
+  resumeAgent: '恢复子任务',
+  wait: '等待子任务',
+  closeAgent: '关闭子任务',
+};
+
+const COLLAB_STATUS_LABELS: Record<string, string> = {
+  pendingInit: '初始化中',
+  running: '运行中',
+  interrupted: '已中断',
+  completed: '已完成',
+  errored: '出错',
+  shutdown: '已关闭',
+  notFound: '未找到',
+};
+
+function oneLine(value: string, max: number): string {
+  const clean = value.replace(/\s+/g, ' ').trim();
+  return clean.length > max ? `${clean.slice(0, max)}…` : clean;
+}
+
+function shortAgentId(value: string): string {
+  return value.length > 12 ? `…${value.slice(-8)}` : value;
+}
+
+function collabStateLines(item: Extract<ThreadItem, { type: 'collabAgentToolCall' }>): string[] {
+  return Object.entries(item.agentsStates ?? {}).map(([id, state]) => {
+    const status = state ? COLLAB_STATUS_LABELS[state.status] ?? state.status : '未知状态';
+    const message = state?.message ? `：${oneLine(state.message, 96)}` : '';
+    return `${shortAgentId(id)} · ${status}${message}`;
+  });
+}
+
+function collabTitle(item: Extract<ThreadItem, { type: 'collabAgentToolCall' }>): string {
+  const label = COLLAB_TOOL_LABELS[item.tool] ?? `协作：${item.tool}`;
+  const prompt = item.prompt ? ` · ${oneLine(item.prompt, 72)}` : '';
+  const states = collabStateLines(item);
+  const status = states.length ? `（${states.join('、')}）` : '';
+  return `${label}${prompt}${status}`;
+}
+
+function collabOutput(item: Extract<ThreadItem, { type: 'collabAgentToolCall' }>): string | undefined {
+  const status =
+    item.status === 'completed'
+      ? '✅ 协作调用完成'
+      : item.status === 'failed'
+        ? '❌ 协作调用失败'
+        : `⏳ 协作调用：${item.status}`;
+  const states = collabStateLines(item);
+  const recipients = item.receiverThreadIds?.length
+    ? `目标子任务：${item.receiverThreadIds.map(shortAgentId).join('、')}`
+    : '';
+  const lines = [status, recipients, ...states].filter(Boolean);
+  return lines.length ? lines.join('\n') : undefined;
+}
+
 /**
  * Optional mapping context. `cwd` — the thread's project working directory —
  * relativizes fileChange title paths (a path OUTSIDE cwd stays absolute on
@@ -97,6 +160,8 @@ function mapItemStart(item: ThreadItem, ctx?: MapContext): AgentEvent | null {
     case 'mcpToolCall':
     case 'dynamicToolCall':
       return { type: 'tool_use', itemId: item.id, title: '工具调用', kind: 'tool' };
+    case 'collabAgentToolCall':
+      return { type: 'tool_use', itemId: item.id, title: collabTitle(item), kind: 'tool' };
     default:
       return null;
   }
@@ -123,6 +188,13 @@ function mapItemComplete(item: ThreadItem): AgentEvent | null {
     case 'mcpToolCall':
     case 'dynamicToolCall':
       return { type: 'tool_result', itemId: item.id };
+    case 'collabAgentToolCall':
+      return {
+        type: 'tool_result',
+        itemId: item.id,
+        output: collabOutput(item),
+        exitCode: item.status === 'failed' ? 1 : 0,
+      };
     default:
       return null;
   }
