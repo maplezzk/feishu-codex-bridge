@@ -142,15 +142,9 @@ describe('sanitizeContext (sanitization boundary)', () => {
     expect(sanitizeContext('abc', 3, true)).toBe('abc');
   });
 
-  it('keeps the tail of a long one-line message so a trailing requirement survives', () => {
-    const out = sanitizeContext(
-      `select ${'x'.repeat(400)} 调整这个SQL：ozon渠道只要肇庆仓发货的订单`,
-      280,
-      true,
-    );
-    expect(out.length).toBe(280);
-    expect(out.startsWith('select')).toBe(true);
-    expect(out).toContain('调整这个SQL：ozon渠道只要肇庆仓发货的订单');
+  it('passes a long one-line message through when no body limit is configured', () => {
+    const source = `select ${'x'.repeat(400)} 调整这个SQL：ozon渠道只要肇庆仓发货的订单`;
+    expect(sanitizeContext(source, Number.POSITIVE_INFINITY, true)).toBe(source);
   });
 
   it('returns "" for empty input', () => {
@@ -217,11 +211,10 @@ describe('weaveThreadHistory', () => {
     expect(weaveThreadHistory('原文', [])).toBe('原文');
   });
 
-  it('preserves a trailing requirement after a long SQL history message', () => {
-    const out = weaveThreadHistory('', [
-      cm({ text: `select ${'x'.repeat(400)} 调整这个SQL：ozon渠道只要肇庆仓发货的订单` }),
-    ]);
-    expect(out).toContain('调整这个SQL：ozon渠道只要肇庆仓发货的订单');
+  it('passes the complete original long SQL and trailing requirement into history', () => {
+    const source = `select ${'x'.repeat(400)} 调整这个SQL：ozon渠道只要肇庆仓发货的订单`;
+    const out = weaveThreadHistory('', [cm({ text: source })]);
+    expect(out).toContain(source);
   });
 });
 

@@ -34,16 +34,15 @@ import { appendIncompleteContentNotice } from './inbound-content';
  * chars and clamps length right before the text is woven into the prompt.
  */
 
-/** Max chars woven for one quoted message (collapsed to a single line). */
-const QUOTE_MAX = 800;
-/** Max chars per thread-history line (collapsed to a single line each). */
-const LINE_MAX = 280;
-/** Max thread messages woven (most-recent kept). */
-const THREAD_WEAVE_MAX = 20;
-/** How many thread messages to PULL (one page, newest-first) before filtering —
- * bot/system/empty messages drop out, so pull extra headroom over THREAD_WEAVE_MAX.
- * 50 is the Feishu page_size ceiling; older messages beyond it are intentionally
- * dropped (we only want recent context) and the truncation is logged. */
+/** Quoted message bodies are passed through in full (after safe whitespace cleanup). */
+const QUOTE_MAX = Number.POSITIVE_INFINITY;
+/** Thread-history message bodies are passed through in full (after safe whitespace cleanup). */
+const LINE_MAX = Number.POSITIVE_INFINITY;
+/** Keep the full API page; do not locally drop characters or messages within it. */
+const THREAD_WEAVE_MAX = 50;
+/** How many thread messages to pull (one page, newest-first). 50 is the Feishu
+ * page_size ceiling; older messages beyond it are outside this one-page read
+ * and the truncation is logged. */
 const THREAD_PAGE_SIZE = 50;
 
 /** A message pulled for context (the quoted message, or one thread-history entry). */
@@ -684,10 +683,8 @@ export function sanitizeContext(s: string, maxLen: number, oneLine: boolean): st
   out = oneLine ? out.replace(/\s+/g, ' ') : out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
   out = out.trim();
   if (out.length <= maxLen) return out;
-  // A long SQL/log message often puts the actual request after the code. Keep
-  // both ends so the bridge does not silently drop a trailing instruction such
-  // as “只统计肇庆仓发货订单” while still bounding prompt size. Preserve the
-  // old prefix-only behavior for tiny limits used by callers/tests.
+  // Finite limits keep bounded fields (for example sender names) safe. Message
+  // bodies use Infinity above so the original content is passed through intact.
   if (maxLen < 8) return `${out.slice(0, maxLen)}…`;
   const contentLen = maxLen - 1; // one character for the truncation marker
   const headLen = Math.ceil(contentLen * 0.6);
