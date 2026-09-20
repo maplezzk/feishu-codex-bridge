@@ -748,6 +748,19 @@ const PROJECT_TOPICS_MAX = 50;
  * 50-row topics card sits near ~150). Keep this ≤ ~8 unless the row slims down. */
 const PROJECT_LIST_PAGE_SIZE = 8;
 
+/** Project-list display of the defaults used for new topics. Keep the two
+ * dimensions explicit so a missing effort is not mistaken for a missing
+ * model (or silently presented as an arbitrary backend value). */
+function projectModelMeta(p: Pick<Project, 'defaultModel' | 'defaultEffort'>): string {
+  const model = p.defaultModel ?? '后端默认';
+  const effort = p.defaultEffort
+    ? reasoningEffortLabel(p.defaultEffort)
+    : p.defaultModel
+      ? '模型默认'
+      : '后端默认';
+  return `🤖 模型：${model} · 思考：${effort}`;
+}
+
 /** Project list — a SLIM, PAGED overview: one summary line per project + a row
  * of actions (the 🧵 button drills into that project's topics). Topics are NOT
  * listed inline: an active group accumulates dozens, and rendering them all
@@ -777,7 +790,7 @@ export function buildProjectListCard(
       ? `${kindLabel(p.kind)}${(p.origin ?? 'created') === 'joined' ? ' · 🔗已加入' : ''}   ·   免@：${(p.noMention ?? defaultNoMention(p)) ? '开' : '关'}`
       : '⚠️ 未绑定群';
     elements.push(md(`**${p.name}**${p.blank ? ' _(空白)_' : ''}`));
-    elements.push(note(`${dir}\n${meta}`));
+    elements.push(note(`${dir}\n${meta}\n${projectModelMeta(p)}`));
     const row: CardObject[] = [];
     if (p.chatId) row.push(linkButton('💬 打开群聊', openChatUrl(p.chatId)));
     row.push(button(`🧵 ${topicCount} 话题`, { a: DM.projectTopics, n: p.name }));

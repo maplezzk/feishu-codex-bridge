@@ -106,4 +106,15 @@ describe('buildProjectListCard pagination', () => {
     expect(json).not.toContain('页');
     expect(json).toContain('共 5 个项目');
   });
+
+  it('shows each project default model and reasoning effort explicitly', () => {
+    const configured = { ...project(0), defaultModel: 'gpt-5.6-sol', defaultEffort: 'high' as const };
+    const modelOnly = { ...project(1), defaultModel: 'gpt-5.6-terra' };
+    const card = buildProjectListCard([configured, modelOnly, project(2)], new Map(), 0);
+    const json = JSON.stringify(card);
+
+    expect(json).toContain('🤖 模型：gpt-5.6-sol · 思考：高');
+    expect(json).toContain('🤖 模型：gpt-5.6-terra · 思考：模型默认');
+    expect(json).toContain('🤖 模型：后端默认 · 思考：后端默认');
+  });
 });
