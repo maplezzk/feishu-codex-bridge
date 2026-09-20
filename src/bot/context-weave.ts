@@ -683,7 +683,16 @@ export function sanitizeContext(s: string, maxLen: number, oneLine: boolean): st
     .replace(/\r\n?/g, '\n');
   out = oneLine ? out.replace(/\s+/g, ' ') : out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
   out = out.trim();
-  return out.length > maxLen ? `${out.slice(0, maxLen)}…` : out;
+  if (out.length <= maxLen) return out;
+  // A long SQL/log message often puts the actual request after the code. Keep
+  // both ends so the bridge does not silently drop a trailing instruction such
+  // as “只统计肇庆仓发货订单” while still bounding prompt size. Preserve the
+  // old prefix-only behavior for tiny limits used by callers/tests.
+  if (maxLen < 8) return `${out.slice(0, maxLen)}…`;
+  const contentLen = maxLen - 1; // one character for the truncation marker
+  const headLen = Math.ceil(contentLen * 0.6);
+  const tailLen = contentLen - headLen;
+  return `${out.slice(0, headLen)}…${tailLen > 0 ? out.slice(-tailLen) : ''}`;
 }
 
 /**
