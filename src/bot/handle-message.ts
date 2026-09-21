@@ -1480,6 +1480,26 @@ export function createOrchestrator(
         let firstText = ingested;
         let thread = resolved;
         let titleJobKey: string | undefined;
+        // Legacy topic bindings predate persisted model/effort fields. Resolve a
+        // valid current value once for this turn so the run card can render it;
+        // new/unknown bindings also persist the value for later turns. This is
+        // deliberately based on the live backend catalog, never a guessed model.
+        const legacyDefaults =
+          prior?.model && prior.effort
+            ? undefined
+            : pickDefault(await listModels(backendFor(prior?.backend ?? project?.backend)), {
+                model: prior?.model ?? project?.defaultModel,
+                effort: prior?.effort ?? project?.defaultEffort,
+              });
+        const effectiveModel = legacyDefaults?.model ?? prior?.model;
+        const effectiveEffort = legacyDefaults?.effort ?? prior?.effort;
+        const firstRecord = prior
+          ? {
+              ...prior,
+              ...(effectiveModel ? { model: effectiveModel } : {}),
+              ...(effectiveEffort ? { effort: effectiveEffort } : {}),
+            }
+          : null;
         const neverSeen = !thread;
         // codex's history is EMPTY when the session is brand-new (neverSeen) OR a
         // resume failed and we fell back to a new thread (recreated) — both want
@@ -1490,7 +1510,14 @@ export function createOrchestrator(
           // a fresh session bound to the resolved cwd, on the project's backend.
           const cwd = project?.cwd ?? fallbackCwd;
           const be = backendFor(project?.backend);
-          thread = await be.startThread({ cwd, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
+          thread = await be.startThread({
+            cwd,
+            model: effectiveModel,
+            effort: effectiveEffort,
+            mode: perm.mode,
+            network: perm.network,
+            autoCompact: perm.autoCompact,
+          });
           trackSession(sessionKey, thread);
           // 自愈观测：来源=全新会话（无持久化记录），与 resume-ok/resume-recreate
           // 互斥——三者其一 + agent 层的 spawn/prewarm-hit 即可还原完整恢复路径。
@@ -1503,6 +1530,8 @@ export function createOrchestrator(
             sessionId: thread.sessionId,
             backend: be.id,
             titleJobKey,
+            model: effectiveModel,
+            effort: effectiveEffort,
             // `text` is already file-woven when preIngested; use the raw
             // `summaryText` (handleTurn's original) so the session label isn't
             // manifest boilerplate + a temp path.
@@ -1527,6 +1556,8 @@ export function createOrchestrator(
               sessionId: thread.sessionId,
               backend: be.id,
               ...(titleJobKey ? { titleJobKey } : { titleJobKey: undefined }),
+              ...(effectiveModel ? { model: effectiveModel } : {}),
+              ...(effectiveEffort ? { effort: effectiveEffort } : {}),
               updatedAt: Date.now(),
             });
           }
@@ -1578,9 +1609,11 @@ export function createOrchestrator(
           summary: stripFileTokens(summaryText ?? text).slice(0, 80) || '(本轮任务)',
           requesterOpenId: msg.senderId,
           requestedAt: msg.createTime || tIntake,
+          model: effectiveModel,
+          effort: effectiveEffort,
           // 编织完成 → turn/start 之间不再读盘：首轮直接用预取的会话记录
           // （prior=undefined 即确知是全新会话，刚 upsert 的记录还没有 model）。
-          firstRec: prior ?? null,
+          firstRec: firstRecord,
           titleJobKey,
           titleSource,
           timing: { tResolve: tResolveDone - tIntake, tWeave: Date.now() - tIntake },
