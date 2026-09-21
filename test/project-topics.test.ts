@@ -19,7 +19,7 @@ function session(i: number, over: Partial<SessionRecord> = {}): SessionRecord {
 describe('buildProjectTopicsCard model display', () => {
   it('shows the persisted model and reasoning effort for each topic', () => {
     const card = buildProjectTopicsCard(
-      { name: 'ERP', chatId: 'oc_project' },
+      { name: 'ERP', chatId: 'oc_project', defaultModel: 'gpt-5.6-luna', defaultEffort: 'high' },
       [
         session(1, { model: 'gpt-5.6-sol', effort: 'high' }),
         session(2, { model: 'gpt-5.6-terra' }),
@@ -29,7 +29,7 @@ describe('buildProjectTopicsCard model display', () => {
     const json = JSON.stringify(card);
 
     expect(json).toContain('🤖 模型：gpt-5.6-sol · 思考：高');
-    expect(json).toContain('🤖 模型：gpt-5.6-terra · 思考：未记录');
-    expect(json).toContain('🤖 模型：未记录 · 思考：未记录');
+    expect(json).toContain('🤖 模型：gpt-5.6-terra · 思考：高（项目默认，历史未记录）');
+    expect(json).toContain('🤖 模型：gpt-5.6-luna（项目默认，历史未记录） · 思考：高（项目默认，历史未记录）');
   });
 });
