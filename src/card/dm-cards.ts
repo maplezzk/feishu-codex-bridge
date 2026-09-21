@@ -761,6 +761,15 @@ function projectModelMeta(p: Pick<Project, 'defaultModel' | 'defaultEffort'>): s
   return `🤖 模型：${model} · 思考：${effort}`;
 }
 
+/** Session-list display of the model actually persisted for a topic. Old
+ * records may not carry these fields, so show that fact instead of claiming a
+ * project/backend default for an existing conversation. */
+function sessionModelMeta(s: Pick<SessionRecord, 'model' | 'effort'>): string {
+  const model = s.model?.trim() || '未记录';
+  const effort = s.effort ? reasoningEffortLabel(s.effort) : '未记录';
+  return `🤖 模型：${model} · 思考：${effort}`;
+}
+
 /** Project list — a SLIM, PAGED overview: one summary line per project + a row
  * of actions (the 🧵 button drills into that project's topics). Topics are NOT
  * listed inline: an active group accumulates dozens, and rendering them all
@@ -823,7 +832,7 @@ export function buildProjectTopicsCard(
     const sorted = [...sessions].sort((a, b) => b.updatedAt - a.updatedAt);
     for (const s of sorted.slice(0, PROJECT_TOPICS_MAX)) {
       const title = (s.summary || '(空)').replace(/\s+/g, ' ').slice(0, 50);
-      elements.push(note(`· ${title} · ${relativeTime(s.updatedAt)}`));
+      elements.push(note(`· ${title} · ${relativeTime(s.updatedAt)}\n${sessionModelMeta(s)}`));
     }
     if (sorted.length > PROJECT_TOPICS_MAX) {
       elements.push(note(`· …还有 ${sorted.length - PROJECT_TOPICS_MAX} 个话题（更早的可在群里 \`/resume\` 恢复）`));
