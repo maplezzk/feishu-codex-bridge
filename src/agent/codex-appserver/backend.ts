@@ -25,6 +25,7 @@ import { AppServerClient } from './app-server-client';
 import { refillWarmPool, takeWarmClient, utilityRequest } from './client-pool';
 import { mapNotification } from './event-map';
 import { codexVersionAsync, resolveCodexBin } from './locate';
+import { defaultModelProvider } from './usage';
 import type { ServerNotification, Thread, ThreadItem, Turn } from './protocol';
 
 const APPROVAL_POLICY = 'never';
@@ -763,23 +764,40 @@ export class CodexAppServerBackend implements AgentBackend {
 
   async resumeThread(opts: ResumeThreadOptions): Promise<AgentThread> {
     const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
+    // provider 记在会话里（rollout session_meta），codex 默认沿用建会话时那一个：
+    // 用户改了 config.toml 也切不过去，旧会话会一直打旧 provider。所以每次 resume
+    // 现读一次 config 顶层的 model_provider 显式覆盖——改完 config，下一条消息即生效。
+    const provider = await defaultModelProvider();
     for (let attempt = 0; ; attempt++) {
       if (this.retryStopped) throw new Error('agent retry stopped');
       let client: AppServerClient | undefined;
       try {
         client = await this.spawn(opts.cwd);
         const res = await withDeadline(
-          client.request<{ thread: { id: string } }>('thread/resume', {
+          client.request<{ thread: { id: string }; modelProvider?: string }>('thread/resume', {
             threadId: opts.sessionId,
             cwd: opts.cwd,
             approvalPolicy: APPROVAL_POLICY,
             ...sandbox,
             developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
             ...(opts.model ? { model: opts.model } : {}),
+            ...(provider ? { modelProvider: provider } : {}),
           }),
           THREAD_CONTROL_TIMEOUT_MS,
           'thread/resume',
         );
+        if (provider) {
+          // 显式留痕：codex 若不再接受覆盖（版本行为变了），要告警而不是静默沿用旧 provider。
+          if (res.modelProvider && res.modelProvider !== provider) {
+            log.warn('agent', 'provider-override-ignored', {
+              sessionId: opts.sessionId,
+              requested: provider,
+              applied: res.modelProvider,
+            });
+          } else {
+            log.info('agent', 'session-provider', { sessionId: opts.sessionId, provider: res.modelProvider ?? provider });
+          }
+        }
         if (this.retryStopped) {
           await client.close().catch(() => undefined);
           throw new Error('agent retry stopped');

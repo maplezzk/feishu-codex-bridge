@@ -101,22 +101,44 @@ export function jwtExpMs(token: string): number | undefined {
 }
 
 /**
- * ChatGPT 后端 base URL：尊重 `$CODEX_HOME/config.toml` 顶层的 `chatgpt_base_url`
- * （codex manager.rs 同款语义）。只做顶层键的朴素行匹配——第一个 `[section]` 之后不再看。
+ * 读 `$CODEX_HOME/config.toml` 的**顶层**字符串键（codex 的 TOML 语义：第一个
+ * `[section]` 之后就不再算顶层，见 manager.rs）。只做朴素行匹配——这里只用固定
+ * 键名的扁平标量，值为 `"..."`。文件缺失/无该键都返回 undefined。
  */
-export async function chatgptBaseUrl(): Promise<string> {
+async function readTopLevelConfigString(key: string): Promise<string | undefined> {
   try {
     const raw = await readFile(join(resolveCodexHome(), 'config.toml'), 'utf8');
+    const re = new RegExp(`^${key}\\s*=\\s*"([^"]+)"`);
     for (const line of raw.split('\n')) {
       const t = line.trim();
       if (t.startsWith('[')) break; // 进入 section，顶层键扫描结束
-      const m = /^chatgpt_base_url\s*=\s*"([^"]+)"/.exec(t);
-      if (m?.[1]) return m[1].replace(/\/+$/, '');
+      const m = re.exec(t);
+      if (m?.[1]) return m[1];
     }
   } catch {
     // config.toml 可缺省
   }
-  return DEFAULT_BASE_URL;
+  return undefined;
+}
+
+/**
+ * ChatGPT 后端 base URL：尊重 `$CODEX_HOME/config.toml` 顶层的 `chatgpt_base_url`
+ * （codex manager.rs 同款语义）。
+ */
+export async function chatgptBaseUrl(): Promise<string> {
+  const url = await readTopLevelConfigString('chatgpt_base_url');
+  return url ? url.replace(/\/+$/, '') : DEFAULT_BASE_URL;
+}
+
+/**
+ * `$CODEX_HOME/config.toml` 顶层的 `model_provider` —— codex 建线程时解析 provider
+ * 的默认值。bridge 在 resume 老会话时显式回传它：codex 把 provider 记在会话里
+ * （rollout session_meta），不传就永远沿用建会话时那一个——用户改了 config 也切
+ * 不过去，旧会话继续打旧 provider（例如官方额度已满，仍回 usage limit）。
+ * 未配置时返回 undefined：此时保持 codex 自己的默认，绝不硬编码 "openai"。
+ */
+export async function defaultModelProvider(): Promise<string | undefined> {
+  return readTopLevelConfigString('model_provider');
 }
 
 // ── 官方刷新（经 app-server 委托给 codex） ─────────────────────────────

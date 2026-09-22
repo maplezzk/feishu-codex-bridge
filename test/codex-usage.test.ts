@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { UsageError } from '../src/agent/types';
 import {
   chatgptBaseUrl,
+  defaultModelProvider,
   jwtExpMs,
   mapProfileResponse,
   mapUsageResponse,
@@ -196,6 +197,18 @@ describe('auth.json / config.toml readers', () => {
   it('ignores chatgpt_base_url inside a [section] (top-level only)', async () => {
     setup({ 'config.toml': '[mcp_servers.x]\nchatgpt_base_url = "https://evil.example.com"\n' });
     expect(await chatgptBaseUrl()).toBe('https://chatgpt.com/backend-api');
+  });
+
+  it('defaultModelProvider reads the top-level model_provider', async () => {
+    setup({ 'config.toml': 'model_provider = "cider"\nmodel = "deepseek-flash"\n' });
+    expect(await defaultModelProvider()).toBe('cider');
+  });
+
+  it('defaultModelProvider ignores a [section]-scoped model_provider and a missing config', async () => {
+    setup({});
+    expect(await defaultModelProvider()).toBeUndefined();
+    setup({ 'config.toml': '[model_providers.cider]\nmodel_provider = "evil"\n' });
+    expect(await defaultModelProvider()).toBeUndefined();
   });
 });
 
