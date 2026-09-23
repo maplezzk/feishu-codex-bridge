@@ -3,6 +3,8 @@ import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import {
   extractCardText,
   extractMessageText,
+  describeForwardedMessageReadStatus,
+  fetchForwardedMessageContent,
   fetchQuotedMessage,
   fetchThreadContext,
   sanitizeContext,
@@ -140,6 +142,11 @@ describe('sanitizeContext (sanitization boundary)', () => {
     expect(sanitizeContext('abc', 3, true)).toBe('abc');
   });
 
+  it('passes a long one-line message through when no body limit is configured', () => {
+    const source = `select ${'x'.repeat(400)} 调整这个SQL：ozon渠道只要肇庆仓发货的订单`;
+    expect(sanitizeContext(source, Number.POSITIVE_INFINITY, true)).toBe(source);
+  });
+
   it('returns "" for empty input', () => {
     expect(sanitizeContext('', 10, true)).toBe('');
   });
@@ -203,6 +210,12 @@ describe('weaveThreadHistory', () => {
   it('returns text unchanged when there are no messages', () => {
     expect(weaveThreadHistory('原文', [])).toBe('原文');
   });
+
+  it('passes the complete original long SQL and trailing requirement into history', () => {
+    const source = `select ${'x'.repeat(400)} 调整这个SQL：ozon渠道只要肇庆仓发货的订单`;
+    const out = weaveThreadHistory('', [cm({ text: source })]);
+    expect(out).toContain(source);
+  });
 });
 
 // ── fetch + filter (the bug-prone wiring) ────────────────────────────────
@@ -245,6 +258,80 @@ describe('fetchQuotedMessage', () => {
     expect(await fetchQuotedMessage(fakeChannel([{ message_id: 'x', deleted: true }]), 'x')).toBeUndefined();
     expect(await fetchQuotedMessage(fakeChannel([]), 'x')).toBeUndefined();
   });
+
+  it('expands a quoted merge-forward record instead of returning a placeholder', async () => {
+    const q = await fetchQuotedMessage(
+      fakeChannel([
+        { message_id: 'om_q', msg_type: 'merge_forward', create_time: '1000', sender: { id: 'ou_q', sender_type: 'user', sender_name: '王五' }, body: { content: '{}' } },
+        { message_id: 'om_child_1', upper_message_id: 'om_q', msg_type: 'text', create_time: '1100', sender: { id: 'ou_a', sender_type: 'user', sender_name: '甲' }, body: { content: JSON.stringify({ text: '转发里的第一条' }) } },
+        { message_id: 'om_child_2', upper_message_id: 'om_q', msg_type: 'post', create_time: '1200', sender: { id: 'ou_b', sender_type: 'user', sender_name: '乙' }, body: { content: JSON.stringify({ title: '日志', content: [[{ tag: 'text', text: '转发里的第二条' }]] }) } },
+      ]),
+      'om_q',
+    );
+    expect(q?.text).toContain('转发里的第一条');
+    expect(q?.text).toContain('转发里的第二条');
+    expect(q?.text).not.toBe('[合并转发消息]');
+  });
+});
+
+describe('fetchForwardedMessageContent', () => {
+  it('rebuilds flat descendants in time order and preserves nested forwards', async () => {
+    const out = await fetchForwardedMessageContent(
+      fakeChannel([
+        { message_id: 'om_root', msg_type: 'merge_forward', create_time: '1000', sender: { id: 'ou_root', sender_type: 'user', sender_name: '转发人' }, body: { content: '{}' } },
+        { message_id: 'om_late', upper_message_id: 'om_root', msg_type: 'text', create_time: '3000', sender: { id: 'ou_b', sender_type: 'user', sender_name: '乙' }, body: { content: JSON.stringify({ text: '后发消息' }) } },
+        { message_id: 'om_nested', upper_message_id: 'om_root', msg_type: 'merge_forward', create_time: '2000', sender: { id: 'ou_a', sender_type: 'user', sender_name: '甲' }, body: { content: '{}' } },
+        { message_id: 'om_inner', upper_message_id: 'om_nested', msg_type: 'text', create_time: '2100', sender: { id: 'ou_c', sender_type: 'user', sender_name: '丙' }, body: { content: JSON.stringify({ text: '嵌套消息' }) } },
+      ]),
+      'om_root',
+    );
+    expect(out.complete).toBe(true);
+    expect(out.itemCount).toBe(3);
+    expect(out.text).toContain('嵌套消息');
+    expect(out.text).toContain('后发消息');
+    expect(out.text!.indexOf('嵌套消息')).toBeLessThan(out.text!.indexOf('后发消息'));
+  });
+
+  it('reports a visible incomplete result when a forwarded record cannot be fetched', async () => {
+    const ch = {
+      rawClient: { im: { v1: { message: { get: async () => { throw new Error('forbidden'); } } } } },
+    } as unknown as LarkChannel;
+    const out = await fetchForwardedMessageContent(ch, 'om_root');
+    expect(out.complete).toBe(false);
+    expect(out.reason).toBe('fetch-failed');
+    expect(out.text).toBeUndefined();
+  });
+
+  it('marks attachments as unreadable so the caller can ask for source text or a screenshot', async () => {
+    const out = await fetchForwardedMessageContent(
+      fakeChannel([
+        { message_id: 'om_root', msg_type: 'merge_forward', sender: { id: 'ou_root', sender_type: 'user', sender_name: '转发人' }, body: { content: '{}' } },
+        { message_id: 'om_text', upper_message_id: 'om_root', msg_type: 'text', sender: { id: 'ou_t', sender_type: 'user', sender_name: '甲' }, body: { content: JSON.stringify({ text: '图片之前的文字' }) } },
+        { message_id: 'om_img', upper_message_id: 'om_root', msg_type: 'image', sender: { id: 'ou_a', sender_type: 'user', sender_name: '甲' }, body: { content: JSON.stringify({ image_key: 'img' }) } },
+      ]),
+      'om_root',
+    );
+    expect(out.complete).toBe(false);
+    expect(out.reason).toBe('unreadable-child');
+    expect(out.unreadableCount).toBe(1);
+    expect(out.unreadableAttachmentCount).toBe(1);
+    expect(out.text).toContain('[图片]');
+    expect(describeForwardedMessageReadStatus(out)).toBe('已读取 1 条转发消息的文字内容；1 条图片或附件的实际内容未能读取。');
+  });
+
+  it('does not treat an unknown forwarded message type as readable text', async () => {
+    const out = await fetchForwardedMessageContent(
+      fakeChannel([
+        { message_id: 'om_root', msg_type: 'merge_forward', sender: { id: 'ou_root', sender_type: 'user', sender_name: '转发人' }, body: { content: '{}' } },
+        { message_id: 'om_unknown', upper_message_id: 'om_root', msg_type: 'location', sender: { id: 'ou_a', sender_type: 'user', sender_name: '甲' }, body: { content: JSON.stringify({ name: '仓库' }) } },
+      ]),
+      'om_root',
+    );
+    expect(out.complete).toBe(false);
+    expect(out.reason).toBe('unreadable-child');
+    expect(out.text).toContain('[location 消息]');
+    expect(out.unreadableAttachmentCount).toBe(0);
+  });
 });
 
 describe('fetchThreadContext', () => {
@@ -286,6 +373,26 @@ describe('fetchThreadContext', () => {
     }));
     const out = await fetchThreadContext(fakeChannel(many), 'omt_x', { limit: 3 });
     expect(out.map((m) => m.text)).toEqual(['m7', 'm8', 'm9']);
+  });
+
+  it('returns a bridge status message when topic history cannot be read', async () => {
+    const ch = {
+      rawClient: {
+        im: {
+          v1: {
+            message: {
+              list: async () => {
+                throw new Error('permission denied');
+              },
+            },
+          },
+        },
+      },
+    } as unknown as LarkChannel;
+    const out = await fetchThreadContext(ch, 'omt_unreadable');
+    expect(out).toHaveLength(1);
+    expect(out[0]?.bridgeNotice).toBe(true);
+    expect(out[0]?.text).toContain('不要根据标题、摘要、历史上下文或常识猜测缺失内容');
   });
 });
 

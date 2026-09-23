@@ -31,6 +31,7 @@ const STDOUT_INFO_ALLOWLIST = new Set<string>([
   // 自愈链路（kill -9 / 崩溃恢复）的关键节点——低频高信号，进终端便于 e2e 直读：
   // 驱逐（轮间死 / 轮中死）与恢复来源（store resume / 重建 / 全新会话）。
   'agent.dead-thread-evict',
+  'agent.unhealthy-thread-evict',
   'agent.session-evict',
   'agent.resume-ok',
   'agent.resume-recreate',

@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { extractRawCardText, isDegradedCardContent, parseRawCardWrapper } from '../src/bot/card-content';
+import {
+  assessRawCardContent,
+  extractRawCardText,
+  fetchInteractiveCardContent,
+  isDegradedCardContent,
+  isLikelyIncompleteCardText,
+  parseRawCardWrapper,
+} from '../src/bot/card-content';
+import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 
 // The real `json_card` returned by
 //   GET /open-apis/im/v1/messages/:id?card_msg_content_type=raw_card_content
@@ -114,6 +122,80 @@ describe('extractRawCardText', () => {
     expect(text.split('\n')[0]).toBe('请关注记录');
   });
 
+  it('reads direct Card 2.0 fields instead of reducing the card to its title', () => {
+    const card = {
+      schema: '2.0',
+      header: { title: { tag: 'plain_text', content: 'SLS 报警' } },
+      body: {
+        elements: [
+          { tag: 'markdown', content: '发生时间：2026-09-17 09:41:36' },
+          { tag: 'markdown', content: 'taskLockId = 135898309' },
+          {
+            tag: 'markdown',
+            content: '当前 sku 在系统中不存在 VA20260325684468SLB Purple-M',
+          },
+          { tag: 'button', text: { tag: 'plain_text', content: '查看详情' }, url: 'https://example.test/ticket' },
+        ],
+      },
+    };
+    const text = extractRawCardText(card);
+    expect(text.split('\n')[0]).toBe('SLS 报警');
+    expect(text).toContain('发生时间：2026-09-17 09:41:36');
+    expect(text).toContain('taskLockId = 135898309');
+    expect(text).toContain('VA20260325684468SLB Purple-M');
+    expect(text).toContain('[查看详情](https://example.test/ticket)');
+  });
+
+  it('walks collapsed panels, list items, and code-block token contents', () => {
+    const card = {
+      body: {
+        property: {
+          elements: [
+            {
+              tag: 'collapsible_panel',
+              property: {
+                expanded: false,
+                header: {
+                  title: {
+                    property: {
+                      elements: [{ tag: 'plain_text', property: { content: '🧰 2 个工具调用' } }],
+                    },
+                    tag: 'markdown',
+                  },
+                },
+                elements: [
+                  {
+                    tag: 'list',
+                    property: {
+                      items: [
+                        {
+                          elements: [
+                            { tag: 'plain_text', property: { content: '✅ 执行查询' } },
+                          ],
+                        },
+                      ],
+                    },
+                  },
+                  {
+                    tag: 'code_block',
+                    property: {
+                      contents: [{ contents: [{ content: 'select * from warehouse_allocation_shelf;' }] }],
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+        tag: 'body',
+      },
+    };
+    const text = extractRawCardText(card);
+    expect(text).toContain('🧰 2 个工具调用');
+    expect(text).toContain('✅ 执行查询');
+    expect(text).toContain('select * from warehouse_allocation_shelf;');
+  });
+
   it('keeps the body text and the Base record link', () => {
     expect(text).toContain('请处理这条记录');
     expect(text).toContain('[查看杭州天气](https://my.feishu.cn/base/B9lIbXRuFaE7oOsP7q3cbzqqneg?table=tbl9QY31p4n9iS89&record=rec27E5vQq5cvL)');
@@ -138,5 +220,75 @@ describe('extractRawCardText', () => {
   it('yields nothing for an empty / unparseable card', () => {
     expect(extractRawCardText({})).toBe('');
     expect(extractRawCardText(null)).toBe('');
+  });
+});
+
+describe('assessRawCardContent / fetchInteractiveCardContent', () => {
+  it('recognizes the existing property-wrapped automation card as complete', () => {
+    const result = assessRawCardContent(REAL_JSON_CARD);
+    expect(result.complete).toBe(true);
+    expect(result.text).toContain('请处理这条记录');
+  });
+
+  it('marks a title-only raw card as incomplete', () => {
+    expect(assessRawCardContent({ header: { title: { tag: 'plain_text', content: 'SLS 报警' } } })).toEqual({
+      text: 'SLS 报警',
+      complete: false,
+      reason: 'title-only',
+    });
+  });
+
+  it('marks a direct card with a readable body as complete', () => {
+    expect(
+      assessRawCardContent({
+        header: { title: { tag: 'plain_text', content: 'SLS 报警' } },
+        body: { elements: [{ tag: 'markdown', content: 'taskLockId = 1' }] },
+      }),
+    ).toEqual({ text: 'SLS 报警\ntaskLockId = 1', complete: true });
+  });
+
+  it('returns an explicit failure reason when the raw fetch is unavailable', async () => {
+    const ch = {
+      rawClient: { im: { v1: { message: { get: async () => { throw new Error('forbidden'); } } } } },
+    } as unknown as LarkChannel;
+    await expect(fetchInteractiveCardContent(ch, 'om_card')).resolves.toEqual({ complete: false, reason: 'fetch-failed' });
+  });
+
+  it('uses the batch message-detail endpoint when message.get only returns a title', async () => {
+    const titleOnly = JSON.stringify({ json_card: JSON.stringify({ header: { title: { tag: 'plain_text', content: 'WMS 告警' } } }) });
+    const full = JSON.stringify({ json_card: JSON.stringify({
+      header: { title: { tag: 'plain_text', content: 'WMS 告警' } },
+      body: { elements: [{ tag: 'markdown', content: 'container_id: 10120' }] },
+    }) });
+    const calls: unknown[] = [];
+    const ch = {
+      rawClient: {
+        im: { v1: { message: { get: async () => ({ data: { items: [{ body: { content: titleOnly } }] } }) } } },
+        request: async (payload: unknown) => {
+          calls.push(payload);
+          return { data: { items: [{ message_id: 'om_card', body: { content: full } }] } };
+        },
+      },
+    } as unknown as LarkChannel;
+
+    const result = await fetchInteractiveCardContent(ch, 'om_card');
+    expect(result.complete).toBe(true);
+    expect(result.text).toContain('container_id: 10120');
+    expect(calls).toEqual([
+      {
+        method: 'GET',
+        url: '/open-apis/im/v1/messages/mget',
+        params: {
+          card_msg_content_type: 'raw_card_content',
+          with_sender_name: 'true',
+          message_ids: 'om_card',
+        },
+      },
+    ]);
+  });
+
+  it('detects a normalized one-line card title as a risky degraded input', () => {
+    expect(isLikelyIncompleteCardText('SLS 报警')).toBe(true);
+    expect(isLikelyIncompleteCardText('环境\n生产')).toBe(false);
   });
 });

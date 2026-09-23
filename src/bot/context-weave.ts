@@ -1,5 +1,7 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
+import { fetchInteractiveCardContent, isLikelyIncompleteCardText } from './card-content';
+import { appendIncompleteContentNotice } from './inbound-content';
 
 /**
  * Inbound CONTEXT weaving — give codex the上下文 a Feishu @ alone doesn't carry.
@@ -32,16 +34,15 @@ import { log } from '../core/logger';
  * chars and clamps length right before the text is woven into the prompt.
  */
 
-/** Max chars woven for one quoted message (collapsed to a single line). */
-const QUOTE_MAX = 800;
-/** Max chars per thread-history line (collapsed to a single line each). */
-const LINE_MAX = 280;
-/** Max thread messages woven (most-recent kept). */
-const THREAD_WEAVE_MAX = 20;
-/** How many thread messages to PULL (one page, newest-first) before filtering —
- * bot/system/empty messages drop out, so pull extra headroom over THREAD_WEAVE_MAX.
- * 50 is the Feishu page_size ceiling; older messages beyond it are intentionally
- * dropped (we only want recent context) and the truncation is logged. */
+/** Quoted message bodies are passed through in full (after safe whitespace cleanup). */
+const QUOTE_MAX = Number.POSITIVE_INFINITY;
+/** Thread-history message bodies are passed through in full (after safe whitespace cleanup). */
+const LINE_MAX = Number.POSITIVE_INFINITY;
+/** Keep the full API page; do not locally drop characters or messages within it. */
+const THREAD_WEAVE_MAX = 50;
+/** How many thread messages to pull (one page, newest-first). 50 is the Feishu
+ * page_size ceiling; older messages beyond it are outside this one-page read
+ * and the truncation is logged. */
 const THREAD_PAGE_SIZE = 50;
 
 /** A message pulled for context (the quoted message, or one thread-history entry). */
@@ -55,17 +56,256 @@ export interface ContextMessage {
   fromUser: boolean;
   /** create_time as epoch ms (0 when unknown). */
   createTime: number;
+  /** Internal bridge status line; included even though it is not a user message. */
+  bridgeNotice?: boolean;
 }
 
 /** Subset of the `im.v1.message.get` / `.list` item shape we read. */
 interface RawMsgItem {
   message_id?: string;
   msg_type?: string;
-  create_time?: string;
+  create_time?: string | number;
+  upper_message_id?: string;
   deleted?: boolean;
   sender?: { id?: string; sender_type?: string; sender_name?: string };
   body?: { content?: string };
   mentions?: { key?: string; name?: string }[];
+}
+
+export type ForwardedMessageReadReason = 'fetch-failed' | 'empty-response' | 'empty-content' | 'truncated' | 'unreadable-child';
+
+export interface ForwardedMessageContent {
+  text?: string;
+  complete: boolean;
+  reason?: ForwardedMessageReadReason;
+  /** Number of descendant records returned by Feishu (after the 50-item cap). */
+  itemCount: number;
+  /** Descendants that were attachments, deleted, malformed, or otherwise unreadable. */
+  unreadableCount: number;
+  /** Unreadable descendants whose resource body was an image/file/audio/video/sticker. */
+  unreadableAttachmentCount: number;
+  truncated: boolean;
+}
+
+interface ForwardRenderState {
+  unreadableCount: number;
+  unreadableAttachmentCount: number;
+  renderedIds: Set<string>;
+}
+
+const FORWARDED_MAX_ITEMS = 50;
+
+/**
+ * Read a merge-forward message as the flat list returned by
+ * `im.v1.message.get`, then rebuild its parent/child tree locally.  Feishu's
+ * SDK does the same for direct inbound events, but quote/topic context used to
+ * collapse the whole record to `[合并转发消息]`.  Keeping this function here
+ * lets all three entry paths (direct, quote, history) share one expansion.
+ */
+export async function fetchForwardedMessageContent(
+  channel: LarkChannel,
+  messageId: string,
+): Promise<ForwardedMessageContent> {
+  let items: RawMsgItem[];
+  try {
+    const res = await channel.rawClient.im.v1.message.get({ path: { message_id: messageId } });
+    items = ((res.data as { items?: RawMsgItem[] } | undefined)?.items ?? []).filter(Boolean);
+  } catch (err) {
+    log.warn('intake', 'forwarded-content-fetch-failed', { messageId, err: String(err) });
+    return { complete: false, reason: 'fetch-failed', itemCount: 0, unreadableCount: 0, unreadableAttachmentCount: 0, truncated: false };
+  }
+  if (items.length === 0) {
+    return { complete: false, reason: 'empty-response', itemCount: 0, unreadableCount: 0, unreadableAttachmentCount: 0, truncated: false };
+  }
+
+  const capped = items.slice(0, FORWARDED_MAX_ITEMS);
+  const truncated = items.length > FORWARDED_MAX_ITEMS;
+  const children = buildForwardChildren(capped, messageId);
+  const state: ForwardRenderState = { unreadableCount: 0, unreadableAttachmentCount: 0, renderedIds: new Set<string>() };
+  const blocks = await renderForwardTree(messageId, children, channel, state, new Set<string>());
+  const itemCount = [...children.values()].reduce((n, list) => n + list.length, 0);
+  const renderedCount = [...state.renderedIds].length;
+  if (renderedCount < itemCount) state.unreadableCount += itemCount - renderedCount;
+  if (blocks.length === 0) {
+    return {
+      complete: false,
+      reason: 'empty-content',
+      itemCount,
+      unreadableCount: state.unreadableCount,
+      unreadableAttachmentCount: state.unreadableAttachmentCount,
+      truncated,
+    };
+  }
+
+  const footer = truncated ? '\n...（转发记录超过 50 条，后面的消息没有读取）' : '';
+  const text = `<forwarded_messages>\n${blocks.join('\n')}${footer}\n</forwarded_messages>`;
+  return {
+    text,
+    complete: !truncated && state.unreadableCount === 0,
+    reason: truncated ? 'truncated' : state.unreadableCount > 0 ? 'unreadable-child' : undefined,
+    itemCount,
+    unreadableCount: state.unreadableCount,
+    unreadableAttachmentCount: state.unreadableAttachmentCount,
+    truncated,
+  };
+}
+
+/**
+ * Turn the structured read result into a short, truthful status line.  Do not
+ * pass the full forwarded body here: flattening it to a fixed number of chars
+ * made a complete text tail look as if it had never been read.
+ */
+export function describeForwardedMessageReadStatus(content: ForwardedMessageContent): string | undefined {
+  const readableCount = Math.max(0, content.itemCount - content.unreadableCount);
+  switch (content.reason) {
+    case 'unreadable-child': {
+      const parts: string[] = [];
+      if (readableCount > 0) parts.push(`已读取 ${readableCount} 条转发消息的文字内容`);
+      if (content.unreadableAttachmentCount > 0) {
+        parts.push(`${content.unreadableAttachmentCount} 条图片或附件的实际内容未能读取`);
+      }
+      const otherUnreadable = content.unreadableCount - content.unreadableAttachmentCount;
+      if (otherUnreadable > 0) parts.push(`${otherUnreadable} 条子消息正文未能读取`);
+      return parts.length > 0 ? `${parts.join('；')}。` : undefined;
+    }
+    case 'truncated':
+      return `已读取 ${content.itemCount} 条转发消息；超过 50 条的后续消息没有读取。`;
+    case 'fetch-failed':
+      return '转发消息读取接口失败，没有可确认的正文。';
+    case 'empty-response':
+      return '转发消息读取接口返回空结果，没有可确认的正文。';
+    case 'empty-content':
+      return content.itemCount > 0
+        ? `已取得 ${content.itemCount} 条转发记录，但没有可读取的正文。`
+        : '没有可读取的转发正文。';
+    default:
+      return undefined;
+  }
+}
+
+function buildForwardChildren(items: RawMsgItem[], rootId: string): Map<string, RawMsgItem[]> {
+  const map = new Map<string, RawMsgItem[]>();
+  for (const item of items) {
+    const itemId = item.message_id;
+    // The parent itself is returned first and has no upper_message_id.  A
+    // nested item with the same id is retained only when it explicitly names a
+    // parent, which is the same rule as the SDK converter.
+    if (itemId === rootId && !item.upper_message_id) continue;
+    const parentId = item.upper_message_id || rootId;
+    const list = map.get(parentId) ?? [];
+    list.push(item);
+    map.set(parentId, list);
+  }
+  for (const list of map.values()) {
+    list.sort((a, b) => (Number(a.create_time) || 0) - (Number(b.create_time) || 0));
+  }
+  return map;
+}
+
+async function renderForwardTree(
+  parentId: string,
+  children: Map<string, RawMsgItem[]>,
+  channel: LarkChannel,
+  state: ForwardRenderState,
+  ancestors: Set<string>,
+): Promise<string[]> {
+  if (ancestors.has(parentId)) {
+    state.unreadableCount += 1;
+    return [];
+  }
+  const nextAncestors = new Set(ancestors);
+  nextAncestors.add(parentId);
+  const out: string[] = [];
+  for (const item of children.get(parentId) ?? []) {
+    const block = await renderForwardItem(item, children, channel, state, nextAncestors);
+    if (block) out.push(block);
+  }
+  return out;
+}
+
+async function renderForwardItem(
+  item: RawMsgItem,
+  children: Map<string, RawMsgItem[]>,
+  channel: LarkChannel,
+  state: ForwardRenderState,
+  ancestors: Set<string>,
+): Promise<string> {
+  const itemId = item.message_id ?? '';
+  if (itemId) state.renderedIds.add(itemId);
+  else markForwardUnreadable(state);
+  const name = item.sender?.sender_name || (item.sender?.id ? `用户${item.sender.id.slice(-4)}` : '某人');
+  const timestamp = formatForwardedTime(item.create_time);
+  let content = '';
+
+  if (item.deleted) {
+    markForwardUnreadable(state);
+    content = '[消息已撤回，正文不可读]';
+  } else if (item.msg_type === 'merge_forward' || item.msg_type === 'forward') {
+    const nested = itemId
+      ? await renderForwardTree(itemId, children, channel, state, ancestors)
+      : [];
+    if (nested.length === 0) {
+      markForwardUnreadable(state);
+      content = '[转发消息正文未读取到]';
+    } else {
+      content = `<forwarded_messages>\n${nested.join('\n')}\n</forwarded_messages>`;
+    }
+  } else if (item.msg_type === 'interactive') {
+    const fallback = extractMessageText(item.msg_type, item.body?.content, item.mentions);
+    if (itemId && isLikelyIncompleteCardText(fallback)) {
+      const card = await fetchInteractiveCardContent(channel, itemId);
+      if (card.text) content = card.text;
+      else content = fallback;
+      if (!card.complete) markForwardUnreadable(state);
+    } else {
+      content = fallback;
+    }
+  } else {
+    content = extractMessageText(item.msg_type, item.body?.content, item.mentions);
+    const unreadableKind = unreadableForwardKind(item.msg_type, content);
+    if (unreadableKind) markForwardUnreadable(state, unreadableKind === 'attachment');
+  }
+
+  if (!content.trim()) {
+    markForwardUnreadable(state);
+    content = '[转发消息正文未读取到]';
+  }
+  const indented = content
+    .split('\n')
+    .map((line) => `    ${line}`)
+    .join('\n');
+  return `[${timestamp}] ${name}:\n${indented}`;
+}
+
+function unreadableForwardKind(msgType: string | undefined, content: string): 'attachment' | 'body' | undefined {
+  if (msgType === 'text' || msgType === 'post') {
+    return /^\[(text|post) 消息\]$/.test(content.trim()) ? 'body' : undefined;
+  }
+  // Interactive and nested-forward records are handled before this helper.
+  // Resource messages have a truthful placeholder, but their actual bytes are
+  // not present in the forwarded body.  Keep the placeholder and report the
+  // missing attachment separately so readable text remains usable.
+  if (msgType === 'image' || msgType === 'audio' || msgType === 'media' || msgType === 'file' || msgType === 'sticker') {
+    return 'attachment';
+  }
+  // Every other type is either a structured message we do not know how to
+  // render or an SDK shape that did not yield readable text.
+  return 'body';
+}
+
+function markForwardUnreadable(state: ForwardRenderState, attachment = false): void {
+  state.unreadableCount += 1;
+  if (attachment) state.unreadableAttachmentCount += 1;
+}
+
+function formatForwardedTime(value: string | number | undefined): string {
+  const ms = Number(value) || 0;
+  if (ms <= 0) return '时间未知';
+  try {
+    return new Date(ms).toISOString();
+  } catch {
+    return '时间未知';
+  }
 }
 
 // ── pulling ──────────────────────────────────────────────────────────────
@@ -83,7 +323,7 @@ export async function fetchQuotedMessage(
     const items = (res.data as { items?: RawMsgItem[] } | undefined)?.items ?? [];
     const item = items[0];
     if (!item || item.deleted) return undefined;
-    const cm = toContextMessage(item);
+    const cm = await toContextMessage(channel, item);
     return cm.text.trim() ? cm : undefined;
   } catch (err) {
     log.warn('intake', 'quote-fetch-failed', { messageId, err: String(err) });
@@ -97,8 +337,10 @@ export async function fetchQuotedMessage(
  *     as opening context.
  *   - `sinceTime > 0` (existing session): return only messages newer than that —
  *     the chatter that happened between bot turns (codex already has the rest).
- * Bot/app/system messages and the triggering @ message are filtered out. Returns
- * [] on any failure (best-effort). Result is oldest→newest.
+ * Bot/app/system messages and the triggering @ message are filtered out. A
+ * history API failure returns one bridge status message so codex can ask for
+ * the missing source instead of silently acting without context. Result is
+ * oldest→newest.
  */
 export async function fetchThreadContext(
   channel: LarkChannel,
@@ -117,16 +359,28 @@ export async function fetchThreadContext(
       },
     });
     const items = (res.data as { items?: RawMsgItem[] } | undefined)?.items ?? [];
-    const picked = items
-      .filter((it) => !it.deleted)
-      .map(toContextMessage)
-      .filter(
-        (m) =>
-          m.fromUser && // drop the bot's own replies, other apps, system notices
-          m.messageId !== opts.excludeMessageId && // drop the triggering @ message
-          (since === 0 || m.createTime > since) && // delta only for existing sessions
-          m.text.trim().length > 0,
-      );
+    const converted = await Promise.all(
+      items
+        .filter((it) => !it.deleted)
+        .map(async (item) => {
+          try {
+            return await toContextMessage(channel, item);
+          } catch (err) {
+            // A single malformed forwarded child must not erase the rest of a
+            // topic's context. Keep a visible status block so codex can ask for
+            // the missing source instead of guessing.
+            log.warn('intake', 'context-message-convert-failed', { messageId: item.message_id ?? '', err: String(err) });
+            return fallbackContextMessage(item, appendIncompleteContentNotice('', 'forwarded-messages'));
+          }
+        }),
+    );
+    const picked = converted.filter(
+      (m) =>
+        (m.fromUser || m.bridgeNotice) && // drop the bot's own replies, other apps, system notices
+        m.messageId !== opts.excludeMessageId && // drop the triggering @ message
+        (since === 0 || m.createTime > since) && // delta only for existing sessions
+        m.text.trim().length > 0,
+    );
     // `list` returned newest-first; weave oldest→newest, keeping the most recent `limit`.
     picked.sort((a, b) => a.createTime - b.createTime);
     const out = picked.slice(-limit);
@@ -136,7 +390,16 @@ export async function fetchThreadContext(
     return out;
   } catch (err) {
     log.warn('intake', 'thread-context-failed', { threadId, err: String(err) });
-    return [];
+    return [
+      {
+        messageId: `bridge-thread-read-${threadId}`,
+        senderName: '桥接层',
+        text: appendIncompleteContentNotice('', 'forwarded-messages', '话题上文读取接口失败'),
+        fromUser: false,
+        bridgeNotice: true,
+        createTime: Date.now(),
+      },
+    ];
   }
 }
 
@@ -155,14 +418,53 @@ export function filterHistorySince(msgs: ContextMessage[], sinceTime: number): C
   return msgs.filter((m) => m.createTime > sinceTime);
 }
 
-function toContextMessage(item: RawMsgItem): ContextMessage {
+async function toContextMessage(channel: LarkChannel, item: RawMsgItem): Promise<ContextMessage> {
   const id = item.sender?.id ?? '';
   const name = item.sender?.sender_name || (id ? `用户${id.slice(-4)}` : '某人');
+  let text = extractMessageText(item.msg_type, item.body?.content, item.mentions);
+  if (item.msg_type === 'interactive') {
+    if (item.message_id && isLikelyIncompleteCardText(text)) {
+      const card = await fetchInteractiveCardContent(channel, item.message_id);
+      if (card.text) text = card.text;
+      if (!card.complete) {
+        text = appendIncompleteContentNotice(text, 'interactive-card', card.text);
+      }
+    }
+  } else if (item.msg_type === 'merge_forward' || item.msg_type === 'forward') {
+    const forwarded = item.message_id
+      ? await fetchForwardedMessageContent(channel, item.message_id)
+      : {
+          complete: false as const,
+          reason: 'empty-response' as const,
+          itemCount: 0,
+          unreadableCount: 0,
+          unreadableAttachmentCount: 0,
+          truncated: false,
+        };
+    if (forwarded.text) text = forwarded.text;
+    if (!forwarded.complete) {
+      text = appendIncompleteContentNotice(text, 'forwarded-messages', describeForwardedMessageReadStatus(forwarded), {
+        partialReadable: Boolean(forwarded.text && forwarded.itemCount > forwarded.unreadableCount),
+      });
+    }
+  }
   return {
     messageId: item.message_id ?? '',
     senderName: name,
-    text: extractMessageText(item.msg_type, item.body?.content, item.mentions),
+    text,
     fromUser: item.sender?.sender_type === 'user',
+    createTime: Number(item.create_time) || 0,
+  };
+}
+
+function fallbackContextMessage(item: RawMsgItem, text: string): ContextMessage {
+  const id = item.sender?.id ?? '';
+  return {
+    messageId: item.message_id ?? '',
+    senderName: item.sender?.sender_name || (id ? `用户${id.slice(-4)}` : '某人'),
+    text,
+    fromUser: item.sender?.sender_type === 'user',
+    bridgeNotice: item.sender?.sender_type === 'user',
     createTime: Number(item.create_time) || 0,
   };
 }
@@ -380,7 +682,14 @@ export function sanitizeContext(s: string, maxLen: number, oneLine: boolean): st
     .replace(/\r\n?/g, '\n');
   out = oneLine ? out.replace(/\s+/g, ' ') : out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
   out = out.trim();
-  return out.length > maxLen ? `${out.slice(0, maxLen)}…` : out;
+  if (out.length <= maxLen) return out;
+  // Finite limits keep bounded fields (for example sender names) safe. Message
+  // bodies use Infinity above so the original content is passed through intact.
+  if (maxLen < 8) return `${out.slice(0, maxLen)}…`;
+  const contentLen = maxLen - 1; // one character for the truncation marker
+  const headLen = Math.ceil(contentLen * 0.6);
+  const tailLen = contentLen - headLen;
+  return `${out.slice(0, headLen)}…${tailLen > 0 ? out.slice(-tailLen) : ''}`;
 }
 
 /**

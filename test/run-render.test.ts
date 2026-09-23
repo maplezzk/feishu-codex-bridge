@@ -354,9 +354,9 @@ describe('context usage gauge', () => {
     expect(rs.usage).toEqual({ used: 4096, window: 8192 });
   });
 
-  it('keeps the run card clean below the threshold', () => {
+  it('shows compact occupancy below the warning threshold', () => {
     const rs = run([{ type: 'context_usage', usedTokens: 100, contextWindow: 8192 }]);
-    expect(JSON.stringify(buildRunCard({ rs }))).not.toContain('上下文');
+    expect(JSON.stringify(buildRunCard({ rs }))).toContain('上下文 1%');
   });
 
   it('surfaces the gauge + /compact nudge above the threshold', () => {
@@ -366,9 +366,12 @@ describe('context usage gauge', () => {
     expect(json).toContain('/compact');
   });
 
-  it('does not surface the gauge when the window is unknown', () => {
+  it('shows used tokens without a percentage when the window is unknown', () => {
     const rs = run([{ type: 'context_usage', usedTokens: 999999, contextWindow: null }]);
-    expect(JSON.stringify(buildRunCard({ rs }))).not.toContain('上下文');
+    const json = JSON.stringify(buildRunCard({ rs }));
+    expect(json).toContain('上下文');
+    expect(json).toContain('tokens');
+    expect(json).not.toContain('%');
   });
 
   it('renders the gauge as the closing footnote, below the answer', () => {

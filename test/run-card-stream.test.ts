@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { RunCardStream } from '../src/card/run-card-stream';
+import { CARD_API_TIMEOUT_MS, RunCardStream } from '../src/card/run-card-stream';
 import { card, mdStream } from '../src/card/cards';
 
 /** A live frame whose only element is the streamed answer ({@link mdStream}). */
@@ -85,6 +85,15 @@ describe('RunCardStream.streamElement — streaming_mode recovery', () => {
     expect(ch.contents[0].content).toBe('hello world');
   });
 
+  it('keeps retrying transient network errors in the background until recovery', async () => {
+    const ch = fakeChannel([{ code: 'ECONNRESET' }, { code: 'ETIMEDOUT' }]);
+    const s = await growAnswer(ch);
+
+    expect(ch.contents).toHaveLength(1);
+    expect(ch.contents[0].content).toBe('hello world');
+    expect(s.stats().retries).toBe(2);
+  });
+
   it('does not retry a genuine error — logged and dropped, no settings call', async () => {
     const ch = fakeChannel([{ response: { data: { code: 99991663, msg: 'rate limited' } } }]);
     await growAnswer(ch); // must not throw (pump swallows + logs)
@@ -111,6 +120,25 @@ describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
     expect(ch.updates).toHaveLength(1);
     expect(ch.updates[0].data).toContain('terminal');
     expect(delivered).toBe(true);
+  });
+
+  it('retries transient terminal network errors and preserves the terminal frame', async () => {
+    vi.useFakeTimers();
+    const ch = fakeChannel([], [
+      { code: 'ECONNRESET' },
+      { code: 'ETIMEDOUT' },
+      { code: 'ENETUNREACH' },
+      new Error('fetch failed'),
+    ]);
+    const s = new RunCardStream();
+    await s.create(ch, 'oc_m4_network', frame('hi'), {});
+    const done = s.updateCard(ch, frame('terminal'));
+    await vi.runAllTimersAsync();
+
+    await expect(done).resolves.toBe(true);
+    expect(ch.updates).toHaveLength(1);
+    expect(ch.updates[0].data).toContain('terminal');
+    expect(s.stats().retries).toBe(4);
   });
 
   it('keeps the single 200810-window retry for non-rate-limit errors, then gives up without throwing', async () => {
@@ -166,12 +194,32 @@ describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
     expect(ch.updates[1].data).not.toContain('late repaint');
     expect(ch.updates[1].sequence).toBeGreaterThan(ch.updates[0].sequence);
   });
+
+  it('does not leave the run waiting forever when a terminal CardKit update hangs', async () => {
+    vi.useFakeTimers();
+    const ch = fakeChannel();
+    const s = new RunCardStream();
+    await s.create(ch, 'oc_terminal_timeout', frame('initial'), {});
+    ch.rawClient.cardkit.v1.card.update = () => new Promise<never>(() => undefined);
+
+    const terminal = s.finalizeCard(ch, frame('terminal'));
+    // A transient timeout now retries forever. Explicit shutdown cancels the
+    // retry loop and lets the terminal promise settle for this test.
+    await vi.advanceTimersByTimeAsync(CARD_API_TIMEOUT_MS);
+    s.stopRetries();
+    await vi.runAllTimersAsync();
+
+    await expect(terminal).resolves.toBe(false);
+    // Explicit shutdown marks the stream stopped; late stream/repaint attempts
+    // are dropped so they cannot queue another write behind in-flight requests.
+    await expect(s.updateCard(ch, frame('late'))).resolves.toBe(false);
+  });
 });
 
 // M-4: 失败帧不推进基线 —— 丢掉的整卡帧由下一帧整卡重发自愈。
 describe('pump — 失败帧不推进基线（M-4）', () => {
   it('re-routes the next frame as a whole-card update after a failed push', async () => {
-    const ch = fakeChannel([], [{ code: 500 }]); // 第一笔真实整卡推送失败（非限频）
+    const ch = fakeChannel([], [{ code: 400 }]); // 第一笔真实整卡推送失败（永久业务错误）
     const s = new RunCardStream();
     await s.create(ch, 'oc_m4_base', frame('hello'), {});
     s.streamCoalesced(ch, frame('hello'), 'answer'); // 与建卡内容相同 → 去重视为已上卡，基线建立

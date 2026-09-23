@@ -748,6 +748,36 @@ const PROJECT_TOPICS_MAX = 50;
  * 50-row topics card sits near ~150). Keep this ≤ ~8 unless the row slims down. */
 const PROJECT_LIST_PAGE_SIZE = 8;
 
+/** Project-list display of the defaults used for new topics. Keep the two
+ * dimensions explicit so a missing effort is not mistaken for a missing
+ * model (or silently presented as an arbitrary backend value). */
+function projectModelMeta(p: Pick<Project, 'defaultModel' | 'defaultEffort'>): string {
+  const model = p.defaultModel ?? '后端默认';
+  const effort = p.defaultEffort
+    ? reasoningEffortLabel(p.defaultEffort)
+    : p.defaultModel
+      ? '模型默认'
+      : '后端默认';
+  return `🤖 模型：${model} · 思考：${effort}`;
+}
+
+/** Session-list display of the model actually persisted for a topic. Old
+ * records may not carry these fields, so show that fact instead of claiming a
+ * project/backend default for an existing conversation. */
+function sessionModelMeta(
+  s: Pick<SessionRecord, 'model' | 'effort'>,
+  project: Pick<Project, 'defaultModel' | 'defaultEffort'>,
+): string {
+  const storedModel = s.model?.trim();
+  const model = storedModel || project.defaultModel || '未记录';
+  const modelSource = storedModel || !project.defaultModel ? '' : '（项目默认，历史未记录）';
+  const storedEffort = s.effort ? reasoningEffortLabel(s.effort) : undefined;
+  const defaultEffort = project.defaultEffort ? reasoningEffortLabel(project.defaultEffort) : undefined;
+  const effort = storedEffort || defaultEffort || '未记录';
+  const effortSource = storedEffort || !defaultEffort ? '' : '（项目默认，历史未记录）';
+  return `🤖 模型：${model}${modelSource} · 思考：${effort}${effortSource}`;
+}
+
 /** Project list — a SLIM, PAGED overview: one summary line per project + a row
  * of actions (the 🧵 button drills into that project's topics). Topics are NOT
  * listed inline: an active group accumulates dozens, and rendering them all
@@ -777,7 +807,7 @@ export function buildProjectListCard(
       ? `${kindLabel(p.kind)}${(p.origin ?? 'created') === 'joined' ? ' · 🔗已加入' : ''}   ·   免@：${(p.noMention ?? defaultNoMention(p)) ? '开' : '关'}`
       : '⚠️ 未绑定群';
     elements.push(md(`**${p.name}**${p.blank ? ' _(空白)_' : ''}`));
-    elements.push(note(`${dir}\n${meta}`));
+    elements.push(note(`${dir}\n${meta}\n${projectModelMeta(p)}`));
     const row: CardObject[] = [];
     if (p.chatId) row.push(linkButton('💬 打开群聊', openChatUrl(p.chatId)));
     row.push(button(`🧵 ${topicCount} 话题`, { a: DM.projectTopics, n: p.name }));
@@ -800,7 +830,7 @@ export function buildProjectListCard(
 /** Topic drill-down: one project's topics (sessions), newest first, capped to
  * stay under the component limit. Reached via the 🧵 button on the overview. */
 export function buildProjectTopicsCard(
-  project: Pick<Project, 'name' | 'chatId'>,
+  project: Pick<Project, 'name' | 'chatId' | 'defaultModel' | 'defaultEffort'>,
   sessions: SessionRecord[],
 ): CardObject {
   const elements: CardObject[] = [md(`**${project.name}** · 共 ${sessions.length} 个话题`)];
@@ -810,7 +840,7 @@ export function buildProjectTopicsCard(
     const sorted = [...sessions].sort((a, b) => b.updatedAt - a.updatedAt);
     for (const s of sorted.slice(0, PROJECT_TOPICS_MAX)) {
       const title = (s.summary || '(空)').replace(/\s+/g, ' ').slice(0, 50);
-      elements.push(note(`· ${title} · ${relativeTime(s.updatedAt)}`));
+      elements.push(note(`· ${title} · ${relativeTime(s.updatedAt)}\n${sessionModelMeta(s, project)}`));
     }
     if (sorted.length > PROJECT_TOPICS_MAX) {
       elements.push(note(`· …还有 ${sorted.length - PROJECT_TOPICS_MAX} 个话题（更早的可在群里 \`/resume\` 恢复）`));

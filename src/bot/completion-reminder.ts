@@ -6,6 +6,7 @@ import {
   type CompletionReminderOutcome,
 } from '../config/schema';
 import { log } from '../core/logger';
+import { withCardApiTimeout } from '../card/run-card-stream';
 
 export interface CompletionReminderReplyInput {
   cardMsgId: string;
@@ -65,10 +66,15 @@ export async function sendCompletionReminderReply(
     cardUpdated: input.cardUpdated,
   });
   try {
-    await deps.channel.rawClient.im.v1.message.reply({
-      path: { message_id: input.cardMsgId },
-      data: { msg_type: 'post', content, reply_in_thread: input.replyInThread },
-    });
+    const cardMsgId = input.cardMsgId;
+    await withCardApiTimeout(
+      () =>
+        deps.channel.rawClient.im.v1.message.reply({
+          path: { message_id: cardMsgId },
+          data: { msg_type: 'post', content, reply_in_thread: input.replyInThread },
+        }),
+      '完成提醒发送',
+    );
     log.info('card', 'completion-reminder', {
       terminal: input.outcome,
       elapsedMs,
