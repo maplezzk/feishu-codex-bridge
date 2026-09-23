@@ -1,10 +1,10 @@
 import { card, colorNote, hr, note, type CardElement, type CardObject, type NoteColor } from './cards';
 
 /**
- * Context-window usage gauge. The run card stays clean by default; once usage
- * crosses a tier it surfaces a colored one-liner nudging `/compact`. The same
- * tiers back the on-demand `/context` card (which always shows, even below the
- * first threshold) and the model/window numbers come from
+ * Context-window usage helpers. The run card shows a compact occupancy footer
+ * whenever a measurement is available; warning tiers add color and a `/compact`
+ * nudge. The same tiers back the on-demand `/context` card (which always shows,
+ * even below the first threshold), and the model/window numbers come from
  * `thread/tokenUsage/updated` (used = last.totalTokens — the current context
  * occupancy, NOT cumulative total; window = modelContextWindow). Thresholds are
  * fractions of the window — tune here.
@@ -41,18 +41,15 @@ function k(n: number): string {
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(Math.max(0, Math.round(n)));
 }
 
-/**
- * The run-card gauge element — ONLY when usage is at/above {@link CTX_WARN}, so
- * the card carries nothing extra at low usage (per design). Returns null below
- * the threshold or when the window is unknown (can't tier without a percent).
- */
-export function runCardGauge(used: number, window: number | null): CardElement | null {
+/** Run-card occupancy line. Keep low usage muted; color and nudge at warning tiers. */
+export function runCardGauge(used: number, window: number | null): CardElement {
   const pct = ctxPercent(used, window);
-  if (pct === null || !window) return null;
-  const frac = used / window;
-  if (frac < CTX_WARN) return null;
-  const t = ctxTier(frac);
-  return colorNote(`${t.dot} 上下文 ${pct}% · ${k(used)}/${k(window)} · ${t.advice}`, t.color);
+  if (pct === null || !window) return note(`🧠 上下文 ${k(used)} tokens`);
+  const tier = ctxTier(used / window);
+  const icon = tier.level === 0 ? '🧠' : tier.dot;
+  const advice = tier.level > 0 ? ` · ${tier.advice}` : '';
+  const content = `${icon} 上下文 ${pct}% · ${k(used)}/${k(window)} tokens${advice}`;
+  return tier.level === 0 ? note(content) : colorNote(content, tier.color);
 }
 
 /** On-demand `/context` card — always shows, even at low usage. */

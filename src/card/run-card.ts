@@ -24,8 +24,8 @@ import { renderRichText } from './markdown-render';
 import { toolBodyMd, toolHeaderText, toolSummaryLine } from './tool-render';
 import { runCardGauge } from './context-gauge';
 
-/** The context-usage gauge line, only at/above the warn tier (else null). */
-function gaugeEl(state: RunState): CardElement | null {
+/** Compact current context usage for the lower-left run-card footer. */
+function contextUsageEl(state: RunState): CardElement | null {
   return state.usage ? runCardGauge(state.usage.used, state.usage.window) : null;
 }
 
@@ -147,7 +147,8 @@ export function buildRunCard(rc: RunCardState): CardObject {
 
 /**
  * Live layout: reasoning panel, tool panels, ONE streamed answer element,
- * footer (status + model), then the ⏹ controls row pinned at the BOTTOM. Text
+ * footer (status, context usage + optional model), then the ⏹ controls row
+ * pinned at the BOTTOM. Text
  * blocks are concatenated into a single {@link mdStream} element
  * ({@link ANSWER_EID}) so the answer can be driven by the element-level
  * typewriter (cardElement.content) — that needs one stable, append-only text
@@ -188,16 +189,14 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
   const answer = textParts.join('\n\n');
   if (answer) elements.push(mdStream(answer, ANSWER_EID));
 
-  // Footer: status (left) + 模型·effort footnote (right) share one row when the
-  // 显示模型 pref is on; either alone falls back to a single line.
+  // Keep the live status above the footer. Context usage anchors the lower-left
+  // corner while the optional model/effort footnote stays on the lower-right.
+  if (state.footer) elements.push(footerStatus(state.footer));
+  const usage = contextUsageEl(state);
   const mEl = modelEl(rc);
-  if (state.footer && mEl) elements.push(splitRow(footerStatus(state.footer), mEl));
-  else if (state.footer) elements.push(footerStatus(state.footer));
+  if (usage && mEl) elements.push(splitRow(usage, mEl));
+  else if (usage) elements.push(usage);
   else if (mEl) elements.push(mEl);
-  // Context-usage gauge sits just above the controls (only at/above the warn
-  // tier) so it never pushes the answer down.
-  const gauge = gaugeEl(state);
-  if (gauge) elements.push(gauge);
 
   // ⏹ controls row pinned at the BOTTOM — it tracks the newest output where the
   // reader is looking (tradeoff: a long stream may push it below the fold; see
@@ -290,13 +289,13 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
     elements.push(noteMd('_（未返回内容）_'));
   }
 
-  // Context-usage gauge as the closing footnote (only at/above the warn tier).
-  const gauge = gaugeEl(state);
-  if (gauge) elements.push(gauge);
-  // 「模型 · 推理强度」footnote, bottom-right — only the always(始终) mode keeps it
-  // on the terminal card; running(仅输出时) drops it once the turn ends.
+  // Context usage at the lower-left; 「模型 · 推理强度」at lower-right only
+  // when the always(始终) mode keeps the model footnote on terminal cards.
+  const usage = contextUsageEl(state);
   const mEl = rc.modelOnTerminal ? modelEl(rc) : null;
-  if (mEl) elements.push(mEl);
+  if (usage && mEl) elements.push(splitRow(usage, mEl));
+  else if (usage) elements.push(usage);
+  else if (mEl) elements.push(mEl);
 
   return elements;
 }

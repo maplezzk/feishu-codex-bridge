@@ -50,7 +50,7 @@ export interface RunState {
   /** set when terminal === 'idle_timeout' — seconds idle before watchdog gave up */
   idleTimeoutSeconds?: number;
   /** latest context-window usage (from context_usage events); drives the run
-   * card's threshold gauge. `window` null when codex reports no window. */
+   * card's lower-left occupancy footer. `window` null when codex reports no window. */
   usage?: { used: number; window: number | null };
 }
 

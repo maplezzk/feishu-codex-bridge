@@ -4883,6 +4883,7 @@ export function createOrchestrator(
           if (cur) {
             cur.render.apply(ev);
             cur.rc.rs = cur.render.snapshot();
+            if (cur.stream) cur.stream.streamCoalesced(channel, buildRunCard(cur.rc), ANSWER_EID);
           }
           continue;
         }

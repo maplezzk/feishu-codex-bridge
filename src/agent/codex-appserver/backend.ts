@@ -587,7 +587,7 @@ export class CodexAppServerBackend implements AgentBackend {
 
   readonly id = 'codex-appserver';
   readonly displayName = 'Codex (app-server)';
-  private modelCache: ModelInfo[] | null = null;
+  private modelCache: { models: ModelInfo[]; cachedAt: number } | null = null;
 
   constructor(private readonly titleDeps: CodexTitleBackendDeps = DEFAULT_TITLE_DEPS) {}
 
@@ -615,17 +615,23 @@ export class CodexAppServerBackend implements AgentBackend {
   }
 
   async listModels(): Promise<ModelInfo[]> {
-    if (this.modelCache) return this.modelCache;
-    if (!resolveCodexBin()) return STATIC_MODELS;
+    const now = Date.now();
+    if (this.modelCache && now - this.modelCache.cachedAt < MODEL_LIST_CACHE_TTL_MS) {
+      return this.modelCache.models;
+    }
+    if (!resolveCodexBin()) return this.modelCache?.models ?? STATIC_MODELS;
     try {
       // 常驻 utility client（M-2）：原本每次付一套 spawn+initialize，现在共享复用。
       const res = await utilityRequest<{ data?: RawModel[] }>('model/list', { limit: 50 });
       const models = (res.data ?? []).map(mapModel);
-      this.modelCache = models.length ? models : STATIC_MODELS;
-      return this.modelCache;
+      if (models.length > 0) {
+        this.modelCache = { models, cachedAt: Date.now() };
+        return models;
+      }
+      return this.modelCache?.models ?? STATIC_MODELS;
     } catch (err) {
       log.fail('agent', err, { phase: 'model/list' });
-      return STATIC_MODELS;
+      return this.modelCache?.models ?? STATIC_MODELS;
     }
   }
 
@@ -957,6 +963,11 @@ function mapModel(m: RawModel): ModelInfo {
     defaultEffort: m.defaultReasoningEffort ?? 'medium',
   };
 }
+
+/** Refresh the model catalog periodically so models rolled out while the bridge
+ * daemon is running become pickable without a restart. A cached successful list
+ * remains available during a transient refresh failure. */
+const MODEL_LIST_CACHE_TTL_MS = 5 * 60_000;
 
 const STATIC_MODELS: ModelInfo[] = [
   {

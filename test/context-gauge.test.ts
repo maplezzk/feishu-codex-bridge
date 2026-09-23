@@ -43,12 +43,16 @@ describe('ctxPercent', () => {
 });
 
 describe('runCardGauge', () => {
-  it('is null below the warn threshold (run card stays clean)', () => {
-    expect(runCardGauge(10, 100)).toBeNull();
-    expect(runCardGauge(50, 100)).toBeNull();
+  it('shows muted occupancy below the warning threshold', () => {
+    const low = runCardGauge(10, 100) as unknown as Div;
+    expect(low.text.text_color).toBe('grey');
+    expect(low.text.content).toContain('10%');
   });
-  it('is null when the window is unknown (cannot tier)', () => {
-    expect(runCardGauge(9999, null)).toBeNull();
+  it('shows token count without a percentage when the window is unknown', () => {
+    const unknown = runCardGauge(9999, null) as unknown as Div;
+    expect(unknown.text.text_color).toBe('grey');
+    expect(unknown.text.content).toContain('tokens');
+    expect(unknown.text.content).not.toContain('%');
   });
   it('renders a colored, /compact-nudging line at/above the threshold', () => {
     const warn = runCardGauge(70, 100) as unknown as Div;
