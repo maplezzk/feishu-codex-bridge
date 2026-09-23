@@ -1,10 +1,15 @@
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { buildPlist } from '../src/service/launchd';
 import { buildUnit, SYSTEMD_UNIT_NAME } from '../src/service/systemd';
 import { buildLauncherCmd, buildLauncherVbs } from '../src/service/win-startup';
 
-// The systemd unit (Linux/WSL) and the Windows hidden-launcher .cmd/.vbs are
-// generated text that can't be exercised on the mac dev box — lock their shape
-// here so a refactor can't silently break the daemon definitions.
+// These tests cover serialization and configuration semantics. Native execution
+// and executable-selection evidence live in service-smoke.test.ts.
+
+const nativeCodexPath = join(tmpdir(), 'codex tools', 'codex');
+const systemdString = (value: string): string => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%');
 
 describe('systemd unit (buildUnit)', () => {
   const unit = buildUnit();
@@ -28,6 +33,53 @@ describe('systemd unit (buildUnit)', () => {
   it('unit name is a .service', () => {
     expect(SYSTEMD_UNIT_NAME).toMatch(/\.service$/);
   });
+
+  it('preserves an explicit CODEX_BIN override for the background service', () => {
+    withCodexBin(nativeCodexPath, () => {
+      expect(buildUnit()).toContain(`Environment="CODEX_BIN=${systemdString(nativeCodexPath)}"`);
+    });
+  });
+
+  it('escapes a literal percent specifier instead of allowing systemd to expand it', () => {
+    withCodexBin(join(tmpdir(), 'codex%n!', 'codex'), () => {
+      expect(buildUnit()).toContain('codex%%n!');
+    });
+  });
+
+  it('normalizes a relative CODEX_BIN before persisting it', () => {
+    withCodexBin(join('relative tools', 'codex'), () => {
+      expect(buildUnit()).toContain(`Environment="CODEX_BIN=${systemdString(resolve('relative tools', 'codex'))}"`);
+    });
+  });
+
+  it('omits an unset override and serializes an explicit clear', () => {
+    withCodexBin(undefined, () => expect(buildUnit()).not.toContain('CODEX_BIN='));
+    withCodexBin('', () => expect(buildUnit()).toContain('Environment="CODEX_BIN="'));
+    withCodexBin(nativeCodexPath, () => {
+      expect(buildUnit({ codexBin: null })).toContain('Environment="CODEX_BIN="');
+      expect(buildUnit({ codexBin: null })).not.toContain(systemdString(nativeCodexPath));
+    });
+  });
+});
+
+describe('launchd plist (buildPlist)', () => {
+  it('preserves an explicit CODEX_BIN override for the background service', () => {
+    const path = join(tmpdir(), 'Codex & Friends', 'codex');
+    withCodexBin(path, () => {
+      const plist = buildPlist();
+      expect(plist).toContain('<key>CODEX_BIN</key>');
+      expect(plist).toContain(path.replace(/&/g, '&amp;'));
+    });
+  });
+
+  it('omits an unset override and serializes an explicit clear', () => {
+    withCodexBin(undefined, () => expect(buildPlist()).not.toContain('<key>CODEX_BIN</key>'));
+    withCodexBin('', () => expect(buildPlist()).toMatch(/<key>CODEX_BIN<\/key>\s*<string><\/string>/));
+    withCodexBin(nativeCodexPath, () => {
+      expect(buildPlist({ codexBin: null })).toMatch(/<key>CODEX_BIN<\/key>\s*<string><\/string>/);
+      expect(buildPlist({ codexBin: null })).not.toContain(nativeCodexPath);
+    });
+  });
 });
 
 describe('Windows hidden launcher (.cmd)', () => {
@@ -45,6 +97,30 @@ describe('Windows hidden launcher (.cmd)', () => {
     expect(cmd).toContain('>> "');
     expect(cmd).toContain('2>> "');
   });
+
+  it('preserves an explicit CODEX_BIN override for the background service', () => {
+    withCodexBin(nativeCodexPath, () => {
+      expect(buildLauncherCmd()).toContain(`set "CODEX_BIN=${nativeCodexPath}"`);
+    });
+  });
+
+  it('protects literal percent/bang characters and uses UTF-8 for Unicode paths', () => {
+    withCodexBin(join(tmpdir(), 'codex 中文 %USERNAME% !', 'codex.exe'), () => {
+      const launcher = buildLauncherCmd();
+      expect(launcher).toContain('setlocal DisableDelayedExpansion');
+      expect(launcher).toContain('65001');
+      expect(launcher).toContain('codex 中文 %%USERNAME%% !');
+    });
+  });
+
+  it('omits an unset override and serializes an explicit clear', () => {
+    withCodexBin(undefined, () => expect(buildLauncherCmd()).not.toContain('set "CODEX_BIN='));
+    withCodexBin('', () => expect(buildLauncherCmd()).toContain('set "CODEX_BIN="'));
+    withCodexBin(nativeCodexPath, () => {
+      expect(buildLauncherCmd({ codexBin: null })).toContain('set "CODEX_BIN="');
+      expect(buildLauncherCmd({ codexBin: null })).not.toContain(nativeCodexPath);
+    });
+  });
 });
 
 describe('Windows hidden launcher (.vbs)', () => {
@@ -55,3 +131,15 @@ describe('Windows hidden launcher (.vbs)', () => {
     expect(vbs).toMatch(/sh\.Run "cmd \/c "".+\.cmd""", 0, False/);
   });
 });
+
+function withCodexBin(value: string | undefined, fn: () => void): void {
+  const prev = process.env.CODEX_BIN;
+  if (value === undefined) delete process.env.CODEX_BIN;
+  else process.env.CODEX_BIN = value;
+  try {
+    fn();
+  } finally {
+    if (prev === undefined) delete process.env.CODEX_BIN;
+    else process.env.CODEX_BIN = prev;
+  }
+}

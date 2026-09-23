@@ -3,11 +3,13 @@ import { existsSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { normalizeServiceCodexBin, saveServiceCodexBin, selectInstallCodexBin } from './codex-bin';
 import {
   ensureLogFiles,
   resolveCliBinPath,
   serviceStderrPath,
   serviceStdoutPath,
+  type ServiceDefinitionOptions,
   type ServiceStatus,
 } from './common';
 
@@ -37,11 +39,13 @@ function systemdUnitPath(): string {
  * `logs` works uniformly; PATH baked in so child tools (codex, lark-cli) resolve
  * under the minimal systemd environment.
  */
-export function buildUnit(): string {
-  const esc = (s: string): string => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+export function buildUnit(options: ServiceDefinitionOptions = {}): string {
+  const esc = (s: string): string => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%');
   const nodePath = process.execPath;
-  const cliBinPath = resolveCliBinPath();
-  const pathEnv = process.env.PATH ?? '';
+  const cliBinPath = options.cliBinPath ?? resolveCliBinPath();
+  const pathEnv = options.envPath ?? process.env.PATH ?? '';
+  const codexBin = normalizeServiceCodexBin(options.codexBin === undefined ? process.env.CODEX_BIN : options.codexBin);
+  const codexBinEnv = codexBin !== undefined ? `Environment="CODEX_BIN=${esc(codexBin ?? '')}"\n` : '';
   return `[Unit]
 Description=feishu-codex-bridge bot
 After=network-online.target
@@ -52,9 +56,10 @@ Type=simple
 ExecStart="${esc(nodePath)}" "${esc(cliBinPath)}" run
 Restart=always
 RestartSec=5
-StandardOutput=append:${serviceStdoutPath()}
-StandardError=append:${serviceStderrPath()}
+StandardOutput=append:${(options.stdoutPath ?? serviceStdoutPath()).replace(/%/g, '%%')}
+StandardError=append:${(options.stderrPath ?? serviceStderrPath()).replace(/%/g, '%%')}
 Environment="PATH=${esc(pathEnv)}"
+${codexBinEnv}
 
 [Install]
 WantedBy=default.target
@@ -107,11 +112,13 @@ function ensureSystemdOrThrow(): void {
 }
 
 export async function installSystemd(): Promise<ServiceStatus> {
+  const codexBin = selectInstallCodexBin();
   ensureSystemdOrThrow();
   const unitPath = systemdUnitPath();
   await mkdir(dirname(unitPath), { recursive: true });
   await ensureLogFiles();
-  await writeFile(unitPath, buildUnit(), 'utf8');
+  await writeFile(unitPath, buildUnit({ codexBin }), 'utf8');
+  saveServiceCodexBin(codexBin);
 
   const reload = runSystemctl(['daemon-reload']);
   if (!reload.ok) throw systemctlError('systemctl --user daemon-reload', reload);

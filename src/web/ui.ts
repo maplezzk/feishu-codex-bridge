@@ -1,3 +1,4 @@
+import { VOICE_TITLE, VOICE_DESCRIPTION, VOICE_NOTICE, VOICE_DOC_URL } from '../voice/view';
 /**
  * Web 控制台前端 —— 单文件内嵌 HTML（零依赖、零构建）。
  *
@@ -648,6 +649,33 @@ export const UI_HTML = `<!doctype html>
   }
   #confirmMask { z-index: 40; }
   #wizMask.open, #confirmMask.open { display: block; }
+  .voice-card h2 { margin-bottom: 6px; }
+  .voice-description { color: var(--text-2); font-size: 13px; line-height: 1.7; }
+  .voice-notice { margin-top: 6px; color: var(--text-3); font-size: 12px; line-height: 1.8; }
+  .voice-notice a { display: inline-block; margin-left: 4px; white-space: nowrap; text-underline-offset: 3px; }
+  .voice-controls { display: flex; align-items: center; margin-top: 18px; padding: 14px 0; border-top: 1px solid var(--border); }
+  .voice-switch { position: relative; min-height: 28px; border: 0; border-radius: 5px; background: transparent; color: var(--text); cursor: pointer; padding: 3px 4px 3px 48px; font: inherit; font-size: 13px; }
+  .voice-switch::before { content: ''; position: absolute; left: 0; top: 50%; margin-top: -10px; width: 36px; height: 20px; border-radius: 12px; background: var(--text-3); transition: background .15s; }
+  .voice-switch::after { content: ''; position: absolute; left: 3px; top: 50%; margin-top: -7px; width: 14px; height: 14px; border-radius: 50%; background: white; transition: transform .15s; }
+  .voice-switch[aria-checked="true"]::before { background: var(--accent); }
+  .voice-switch[aria-checked="true"]::after { transform: translateX(16px); }
+  .voice-switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+  .voice-switch:disabled { opacity: .5; cursor: default; }
+  .voice-status { padding: 13px 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); color: var(--text-2); font-size: 12.5px; line-height: 1.7; overflow-wrap: anywhere; }
+  .voice-status-line { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .voice-code { color: var(--text-3); font: 11px var(--mono); }
+  .voice-permission { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; }
+  .voice-permission-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .voice-hint { color: var(--text-3); font-size: 12px; line-height: 1.6; }
+  .voice-permission .btn, .voice-footer .btn { min-width: 84px; min-height: 32px; justify-content: center; flex-shrink: 0; text-decoration: none; }
+  .voice-footer { display: flex; justify-content: flex-end; margin-top: 14px; padding-right: 15px; }
+  .voice-card .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .voice-stopped { margin-top: 10px; }
+  @media (max-width: 480px) {
+    .voice-card { padding: 18px; }
+    .voice-permission { align-items: flex-start; flex-direction: column; gap: 10px; }
+    .voice-permission-actions { align-self: flex-end; }
+  }
   .switch { cursor: pointer; user-select: none; }
   .bot-row { display: flex; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
   .bot-row:last-child { border-bottom: 0; }
@@ -2086,6 +2114,7 @@ ${UI_PURE_JS}
     renderProjects(projList, pcount, b);
 
     // 🔔 普通任务结束提醒（每 bot 独立）。选择即保存；仅 long 额外展示分钟阈值。
+    renderVoiceCard(right, b);
     renderCompletionReminderCard(right, b);
 
     cols.appendChild(left);
@@ -2106,6 +2135,69 @@ ${UI_PURE_JS}
     var a = el('a', 'btn', label || '🔗 在飞书中打开');
     a.href = botOpenLink(appId, tenant); a.target = '_blank'; a.rel = 'noopener';
     return a;
+  }
+
+  var voiceBusy = {};
+  function renderVoiceCard(root, b) {
+    var box = el('div', 'card voice-card');
+    var heading = el('h2', null, ${JSON.stringify(VOICE_TITLE)}); box.appendChild(heading);
+    box.appendChild(el('div', 'voice-description', ${JSON.stringify(VOICE_DESCRIPTION)}));
+    var notice = el('div', 'voice-notice', ${JSON.stringify(VOICE_NOTICE)} + ' ');
+    var doc = el('a', null, '飞书 ASR 文档'); doc.href = ${JSON.stringify(VOICE_DOC_URL)};
+    doc.target = '_blank'; doc.rel = 'noopener noreferrer'; notice.appendChild(doc);
+    box.appendChild(notice);
+    var controls = el('div', 'voice-controls'); box.appendChild(controls);
+    var status = el('div', 'voice-status', '正在读取状态…');
+    status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); box.appendChild(status);
+    if (!b.running) box.appendChild(el('div', 'voice-hint voice-stopped', '请先启动此机器人。'));
+    root.appendChild(box);
+    fetch('/api/bots/' + encodeURIComponent(b.appId) + '/voice').then(function (r) {
+      if (!r.ok) throw new Error('读取失败'); return r.json();
+    }).then(function (v) {
+      if (!box.isConnected) return;
+      var h = v.feishu;
+      var testing = h.state === 'testing';
+      var cooling = h.retryAt && h.retryAt > Date.now();
+      var toggle = el('button', 'voice-switch', v.enabled ? '已开启' : '已关闭');
+      toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-label', ${JSON.stringify(VOICE_TITLE)});
+      toggle.setAttribute('aria-checked', String(v.enabled));
+      toggle.disabled = !b.running || !!voiceBusy[b.appId] || (!v.enabled && testing);
+      toggle.onclick = function () { voiceWrite(b.appId, { action: v.enabled ? 'disable' : 'enable' }); };
+      controls.appendChild(toggle);
+      var test = el('button', 'btn sm', testing ? '检测中…' : '测试');
+      test.disabled = !v.enabled || !b.running || !!voiceBusy[b.appId] || testing || !!cooling;
+      test.onclick = function () { voiceWrite(b.appId, { action: 'test' }); };
+      status.textContent = '';
+      status.style.display = v.enabled ? '' : 'none';
+      var statusLine = el('div', 'voice-status-line');
+      statusLine.appendChild(el('span', null, h.state === 'missing_permission' ? '缺少语音识别权限' : v.result));
+      if (h.code) statusLine.appendChild(el('span', 'voice-code', h.code));
+      status.appendChild(statusLine);
+      if (cooling) status.appendChild(el('div', 'voice-hint', '可重试时间：' + new Date(h.retryAt).toLocaleTimeString()));
+      if (v.enabled && h.state === 'missing_permission') {
+        var permission = el('div', 'voice-permission');
+        permission.appendChild(el('div', 'voice-hint', '授权并发布应用后，点击重新检测。'));
+        var permissionActions = el('div', 'voice-permission-actions');
+        var grant = el('a', 'btn sm primary', '去授权'); grant.href = v.grantUrl;
+        grant.target = '_blank'; grant.rel = 'noopener noreferrer'; permissionActions.appendChild(grant);
+        var recheck = el('button', 'btn sm', '重新检测');
+        recheck.disabled = !b.running || !!voiceBusy[b.appId];
+        recheck.onclick = function () { voiceWrite(b.appId, { action: 'refreshPermission' }); };
+        permissionActions.appendChild(recheck); permission.appendChild(permissionActions); status.appendChild(permission);
+      }
+      if (v.enabled) {
+        var testingControls = el('div', 'voice-footer'); testingControls.appendChild(test); box.appendChild(testingControls);
+      }
+    }).catch(function () { status.textContent = '无法读取状态，请刷新重试。'; });
+  }
+  function voiceWrite(botId, body) {
+    voiceBusy[botId] = true;
+    renderRoute();
+    fetch('/api/bots/' + encodeURIComponent(botId) + '/voice', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    }).then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.message || '设置失败'); return j; }); })
+      .catch(function (err) { toast(err.message || '请求失败'); })
+      .finally(function () { delete voiceBusy[botId]; loadState(); });
   }
 
   function renderBotOverview(card, b) {

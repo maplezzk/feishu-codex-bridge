@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentEvent } from '../src/agent/types';
-import { buildRunCard, RC } from '../src/card/run-card';
+import { ANSWER_EID, buildRunCard, RC } from '../src/card/run-card';
 import {
   initialState,
   markIdleTimeout,
@@ -103,10 +103,10 @@ describe('reduce', () => {
     ]);
     expect(s.terminal).toBe('running');
     expect(s.footer).toBe('retrying');
-    // the running layout survives: ⏹ stays, the retrying notice shows
-    const json = JSON.stringify(buildRunCard({ rs: s, cardKey: 'm1' }));
+    const card = buildRunCard({ rs: s, cardKey: 'm1' });
+    const json = JSON.stringify(card);
     expect(json).toContain('自动重试中');
-    expect(json).toContain('⏹ 终止');
+    expect(buttons(card)[0]).toMatchObject({ a: RC.stop, icon: 'stop-record_filled' });
     expect(json).not.toContain('agent 失败');
     // the retry succeeded → deltas overwrite the retrying footer
     const resumed = reduce(s, { type: 'text_delta', itemId: 'a', delta: ' again' });
@@ -160,14 +160,35 @@ describe('buildRunCard', () => {
   });
 });
 
-/** Collect every button's {label, action, msgId} from a built card. */
-function buttons(node: unknown, acc: { label: string; a: unknown; m: unknown }[] = []): { label: string; a: unknown; m: unknown }[] {
+interface RenderedButton {
+  label?: string;
+  a: unknown;
+  m: unknown;
+  type: unknown;
+  size: unknown;
+  width: unknown;
+  icon: unknown;
+  iconColor: unknown;
+  tooltip: unknown;
+}
+
+function buttons(node: unknown, acc: RenderedButton[] = []): RenderedButton[] {
   if (Array.isArray(node)) node.forEach((n) => buttons(n, acc));
   else if (node && typeof node === 'object') {
     const o = node as Record<string, any>;
     if (o.tag === 'button') {
       const value = o.behaviors?.[0]?.value ?? {};
-      acc.push({ label: o.text?.content, a: value.a, m: value.m });
+      acc.push({
+        label: o.text?.content,
+        a: value.a,
+        m: value.m,
+        type: o.type,
+        size: o.size,
+        width: o.width,
+        icon: o.icon?.token,
+        iconColor: o.icon?.color,
+        tooltip: o.hover_tips?.content,
+      });
     }
     for (const k of Object.keys(o)) buttons(o[k], acc);
   }
@@ -177,30 +198,56 @@ function buttons(node: unknown, acc: { label: string; a: unknown; m: unknown }[]
 describe('buildRunCard — goal controls', () => {
   const running = (): RunState => run([{ type: 'text_delta', itemId: 'a', delta: 'working…' }]);
 
-  it('renders BOTH 终止 and 结束目标 on a goal card, wired to the right actions', () => {
+  it('renders an icon-only blue outlined stop control beside 结束目标 with distinct actions', () => {
     const btns = buttons(buildRunCard({ rs: running(), cardKey: 'g1', goalControls: true }));
     expect(btns).toHaveLength(2);
     const stop = btns.find((b) => b.a === RC.stop);
     const end = btns.find((b) => b.a === RC.endGoal);
-    expect(stop).toMatchObject({ label: '⏹ 终止', m: 'g1' });
+    expect(stop).toMatchObject({
+      label: undefined,
+      m: 'g1',
+      type: 'primary',
+      size: 'medium',
+      width: 'default',
+      icon: 'stop-record_filled',
+      iconColor: 'blue',
+      tooltip: '立即停止并结束目标',
+    });
     expect(end).toMatchObject({ label: '🎯 结束目标', m: 'g1' });
   });
 
-  it('renders only ⏹ 终止 on a normal (non-goal) run card', () => {
+  it('renders an icon-only blue outlined stop control on an ordinary run card', () => {
     const btns = buttons(buildRunCard({ rs: running(), cardKey: 'm1' }));
     expect(btns).toHaveLength(1);
-    expect(btns[0]).toMatchObject({ label: '⏹ 终止', a: RC.stop });
+    expect(btns[0]).toEqual({
+      label: undefined,
+      a: RC.stop,
+      m: 'm1',
+      type: 'primary',
+      size: 'medium',
+      width: 'default',
+      icon: 'stop-record_filled',
+      iconColor: 'blue',
+      tooltip: '停止生成',
+    });
   });
 
   it('renders no controls without a cardKey (nothing to route to)', () => {
     expect(buttons(buildRunCard({ rs: running(), goalControls: true }))).toHaveLength(0);
   });
 
-  it('after 结束目标 (goalEnding): drops 结束目标, keeps ⏹ 终止, shows the notice', () => {
+  it('after 结束目标, keeps the icon-only stop control and shows the notice', () => {
     const card = buildRunCard({ rs: running(), cardKey: 'g1', goalControls: true, goalEnding: true });
     const btns = buttons(card);
     expect(btns).toHaveLength(1);
-    expect(btns[0]).toMatchObject({ label: '⏹ 终止', a: RC.stop });
+    expect(btns[0]).toMatchObject({
+      label: undefined,
+      a: RC.stop,
+      type: 'primary',
+      icon: 'stop-record_filled',
+      iconColor: 'blue',
+      tooltip: '停止生成',
+    });
     expect(JSON.stringify(card)).toContain('目标已解除');
   });
 });
@@ -254,7 +301,7 @@ describe('buildRunCard — terminal collapse', () => {
     expect(els.some((e) => e.tag === 'collapsible_panel')).toBe(true);
     expect(els.some((e) => e.tag === 'markdown' && e.content === 'partial ans')).toBe(true);
     expect(JSON.stringify(els)).toContain('已被中断');
-    expect(JSON.stringify(els)).not.toContain('终止');
+    expect(buttons(els).some((button) => button.a === RC.stop)).toBe(false);
   });
 
   it('folds process and shows the error note when the agent fails', () => {
@@ -320,14 +367,13 @@ describe('buildRunCard — full command visibility', () => {
     events.push({ type: 'done', turnId: 'x' });
     const card = buildRunCard({ rs: run(events) });
     const json = JSON.stringify(card);
-    // not degraded to a batched summary (the summary title says「N 个工具调用」;
-    // the process-fold header only says「N 个工具」) — and 1 fold + 5 tool panels.
+    // Every operation retains an independently expandable detail inside its group.
     expect(json).not.toContain('个工具调用');
-    expect(panelCount(card)).toBe(6);
+    expect(panelCount(card)).toBe(7); // process + consecutive-tool group + 5 details
     for (let i = 0; i < 5; i++) expect(json).toContain(`FULLCMD_TAIL_${i}`);
   });
 
-  it('degrades a huge run to a batched summary that STILL lists full commands (and never explodes the card)', () => {
+  it('keeps a large process inside the native panel without a separate viewer action', () => {
     const events: AgentEvent[] = [];
     const cmd0 = `run ${'a'.repeat(90)} BATCHED_TAIL`;
     for (let i = 0; i < 130; i++) {
@@ -338,10 +384,12 @@ describe('buildRunCard — full command visibility', () => {
     events.push({ type: 'done', turnId: 'x' });
     const card = buildRunCard({ rs: run(events) });
     const json = JSON.stringify(card);
-    expect(json).toContain('130 个工具调用'); // degraded to the summary (component budget)
-    expect(json).toContain('BATCHED_TAIL'); // ...but a batched command is still shown in full
-    // component-budget guard held: the card is a handful of panels, not 130
-    expect(panelCount(card)).toBeLessThan(10);
+    expect(json).not.toContain('run.process.');
+    expect(json).not.toContain('查看全部操作');
+    expect(json).toContain('BATCHED_TAIL');
+    for (let i = 1; i < 130; i++) expect(json).toContain(`cmd ${i}\\n`);
+    expect(json).not.toContain('项过程已省略（卡片容量限制）');
+    expect(Buffer.byteLength(json, 'utf8')).toBeLessThan(28000);
   });
 });
 
@@ -429,5 +477,96 @@ describe('模型 · 推理强度 footnote（模型显示三档）', () => {
     expect(json).toContain('超强');
     expect(json).toContain('purple');
     expect(json).not.toContain('undefined');
+  });
+});
+
+// issue #14：`![](src)` 在飞书卡片里是「图片节点」，src 不是 image_key 就渲染成坏图，
+// 而且流式卡片会看着卡在引用处。所以运行卡：已上传的换成 img 元素、未上传的给占位、
+// 引用还没写完的按住不发；终态未解析的降级成「文字 + 反引号路径」，绝不发裸 `![]()`。
+describe('buildRunCard — 图片（issue #14）', () => {
+  const withImage = (): RunState =>
+    run([{ type: 'text_delta', itemId: 'a', delta: '预览：\n\n![拼图](video_frames/contact_sheet.jpg)' }]);
+  const withImageDone = (): RunState =>
+    run([
+      { type: 'text_delta', itemId: 'a', delta: '预览：\n\n![拼图](video_frames/contact_sheet.jpg)' },
+      { type: 'done', turnId: 't1' },
+    ]);
+  const KEYS = new Map([['video_frames/contact_sheet.jpg', 'img_v2_key']]);
+
+  it('running：已上传的引用渲染成小标签（标题 = alt），展开体是真图', () => {
+    const els = bodyEls(buildRunCard({ rs: withImage(), cardKey: 'm1', images: KEYS }));
+    const pill = els.find((e) => e.tag === 'collapsible_panel') as Record<string, any>;
+    expect(pill.header.title.content).toBe("<font color='blue'>拼图</font>"); // 链接样式：蓝字
+    expect(pill.header.width).toBe('auto_when_fold');
+    expect(pill.expanded).toBe(false);
+    expect(pill.elements[0]).toMatchObject({ tag: 'img', img_key: 'img_v2_key', mode: 'fit_horizontal', preview: true });
+    expect(JSON.stringify(els)).not.toContain('![');
+  });
+
+  it('running：还在上传的引用只给占位，不发裸 markdown', () => {
+    const json = JSON.stringify(bodyEls(buildRunCard({ rs: withImage(), cardKey: 'm1' })));
+    expect(json).not.toContain('![');
+    expect(json).toContain('图片处理中');
+  });
+
+  it('running：图后的文字仍是打字机元素（ANSWER_EID 落在最后一段 markdown）', () => {
+    const rs = run([
+      { type: 'text_delta', itemId: 'a', delta: '前 ![拼图](shot.jpg) 后' },
+    ]);
+    const els = bodyEls(buildRunCard({ rs, cardKey: 'm1', images: new Map([['shot.jpg', 'k']]) }));
+    // answer run first (footer + ⏹ 控件跟在后面)
+    expect(els.slice(0, 3).map((e) => e.tag)).toEqual(['markdown', 'collapsible_panel', 'markdown']);
+    expect(els[0]!.element_id).toBeUndefined();
+    expect(els[2]!.element_id).toBe(ANSWER_EID);
+  });
+
+  it('terminal：已上传的引用同样是小标签（展开体里是真图）', () => {
+    const els = bodyEls(buildRunCard({ rs: withImageDone(), images: KEYS }));
+    expect(JSON.stringify(els)).toContain('"img_key":"img_v2_key"');
+    expect(els.some((e) => e.tag === 'collapsible_panel')).toBe(true);
+  });
+
+  it('terminal：未解析的引用降级成文字 + 反引号路径（不出现裸 ![]()）', () => {
+    const json = JSON.stringify(bodyEls(buildRunCard({ rs: withImageDone() })));
+    expect(json).not.toContain('![');
+    expect(json).toContain('未能显示：`video_frames/contact_sheet.jpg`');
+  });
+});
+
+// 表格类回答走 report 渲染器；表格里放不下的图统一挪到回答末尾（渲染层改写，不靠提示词）
+describe('buildRunCard — 表格与图片（渲染层改写）', () => {
+  const TABLE_ANSWER = [
+    '项目里共有 **32 个图片文件**。',
+    '',
+    '## 1. 根目录（1 个）',
+    '',
+    '| 文件 | 尺寸 | 说明 |',
+    '|---|---|---|',
+    '| [contact_sheet.jpg](video_frames/contact_sheet.jpg) | 1480×3943 | 拼图总览 |',
+  ].join('\n');
+  const KEYS = new Map([['video_frames/contact_sheet.jpg', 'img_v2_sheet']]);
+
+  const doneWith = (text: string): RunState => run([{ type: 'text', itemId: 'a', text }, { type: 'done', turnId: 't1' }]);
+
+  it('有 GFM 表格 → 渲染成原生 table，而不是一坨竖线', () => {
+    const els = bodyEls(buildRunCard({ rs: doneWith(TABLE_ANSWER), images: KEYS }));
+    expect(els.some((e) => e.tag === 'table')).toBe(true);
+    expect(JSON.stringify(els)).not.toContain('|------|');
+  });
+
+  it('表格里放不下的图 → 单元格只剩文字，图在小标签里出现在回答末尾', () => {
+    const els = bodyEls(buildRunCard({ rs: doneWith(TABLE_ANSWER), images: KEYS }));
+    const tableEl = els.find((e) => e.tag === 'table') as Record<string, any>;
+    expect(tableEl.rows[0].c0).toBe('contact_sheet.jpg');
+    const pill = els.find((e) => e.tag === 'collapsible_panel') as Record<string, any>;
+    expect(pill.header.title.content).toContain('contact_sheet.jpg'); // 链接样式：蓝字标题
+    expect(pill.elements[0]).toMatchObject({ tag: 'img', img_key: 'img_v2_sheet' });
+    expect(els.indexOf(pill)).toBeGreaterThan(els.indexOf(tableEl)); // 在表格之后
+  });
+
+  it('没有表格的回答仍走普通 markdown 路径（图留在原位）', () => {
+    const els = bodyEls(buildRunCard({ rs: doneWith('看这个：\n\n![拼图](video_frames/contact_sheet.jpg)'), images: KEYS }));
+    expect(els.some((e) => e.tag === 'table')).toBe(false);
+    expect(els.some((e) => e.tag === 'collapsible_panel')).toBe(true);
   });
 });

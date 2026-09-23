@@ -1,3 +1,4 @@
+import { voiceView, VOICE_TITLE, VOICE_DESCRIPTION, VOICE_NOTICE, VOICE_DOC_URL } from '../voice/view';
 import {
   COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES,
   COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES,
@@ -56,6 +57,10 @@ export const DM = {
   joinGroupSubmit: 'dm.joinGroup.submit',
   projects: 'dm.projects',
   settings: 'dm.settings',
+  voiceSettings: 'dm.voice.settings',
+  setVoice: 'dm.voice.set',
+  testVoice: 'dm.voice.test',
+  refreshVoicePermission: 'dm.voice.refreshPermission',
   // ☕ 咖啡一下（离开接管）：从全局设置卡进入的二级卡片（仿云文档评论那样的子卡入口）
   coffeeSettings: 'dm.coffee.settings',
   doctor: 'dm.doctor',
@@ -922,6 +927,25 @@ function summarizeCommentSettings(cfg: AppConfig): string {
   return `${backend} · ${model} · ${effort}`;
 }
 
+export function buildVoiceSettingsCard(cfg: AppConfig, notice?: string): CardObject {
+  const v = voiceView(cfg);
+  const testing = v.feishu.state === 'testing';
+  const cooling = (v.feishu.retryAt ?? 0) > Date.now();
+  const toggle = button(v.enabled ? '已开启 · 点击关闭' : '已关闭 · 点击开启', { a: DM.setVoice, v: v.enabled ? 'off' : 'on' }, v.enabled ? 'primary' : 'default');
+  const test = button(testing ? '检测中…' : '测试', { a: DM.testVoice });
+  return card([
+    md(VOICE_DESCRIPTION),
+    actions([{ ...toggle, disabled: !v.enabled && testing }]),
+    md(notice ?? `${v.result}${v.feishu.code ? `（${v.feishu.code}）` : ''}`),
+    ...(cooling ? [note(`可重试时间：${new Date(v.feishu.retryAt!).toLocaleTimeString()}`)] : []),
+    ...(v.enabled && v.feishu.state === 'missing_permission' ? [
+      note('授权并发布应用后，点击重新检测。'),
+      actions([linkButton('去授权', v.grantUrl), button('重新检测', { a: DM.refreshVoicePermission })]),
+    ] : []),
+    actions([button('⬅️ 设置', { a: DM.settings }), ...(v.enabled ? [{ ...test, disabled: testing }] : [])]),
+  ], { header: { title: '🎙️ ' + VOICE_TITLE }, forward: false });
+}
+
 /**
  * Global preferences card. Grouped into sections (📤 输出展示 / ⏱ 运行控制), each
  * setting a self-explaining {@link settingItem} (name + grey caption + option
@@ -1013,7 +1037,6 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
       note('去倒杯咖啡的工夫，我替你盯着本机的 Claude Code / Codex——它要审批、要问你、或跑完了，都推到这个私聊。含通知范围、转发后端、离开保活、hooks 修复。'),
       actions([button('设置咖啡一下 / 通知 / 保活 / hooks', { a: DM.coffeeSettings }, 'primary')]),
       hr(),
-      settingSection('🧩 专项功能'),
       note('会话标题与云文档评论分别配置，互不影响，也不会改变普通聊天使用的模型。'),
       md('**🏷️ 会话标题**'),
       note('让 Bridge 新建的会话在 Claude Code / Codex 的恢复列表（/resume）中显示易识别的标题。'),
@@ -1024,6 +1047,11 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
       note('在飞书文档、表格或多维表格（含 wiki）的评论里 @我，自动运行 Agent 并回复；回复规则可控制是否直接修改文档。'),
       md(`**当前**：${summarizeCommentSettings(cfg)}`),
       actions([button('配置评论处理', { a: DM.commentSettings }, 'primary')]),
+      hr(),
+      md('**🎙️ ' + VOICE_TITLE + '**'),
+      note(VOICE_DESCRIPTION),
+      note(`${VOICE_NOTICE} [飞书 ASR 文档](${VOICE_DOC_URL})`),
+      actions([button(cfg.preferences?.voice?.enabled ? '去关闭' : '去开启', { a: DM.voiceSettings })]),
       hr(),
       actions([button('👮 管理员', { a: DM.admins }), button('⬅️ 菜单', { a: DM.menu })]),
     ],

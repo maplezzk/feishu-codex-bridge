@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +10,8 @@ import { AdminWriteError } from '../src/admin/ops';
 // 内存 stub：server 层单测不碰真实文件/注册表（service 自有专门的集成测试）。
 function stubService(): AdminService {
   return {
+    async getVoice() { return { enabled: false, feishu: { state: 'unchecked' as const, message: '尚未检测' }, result: '尚未测试', grantUrl: 'https://open.feishu.cn/' }; },
+    async setVoice() {},
     async listBots() {
       return [
         {
@@ -221,7 +223,14 @@ async function jsonOf(res: Response): Promise<any> {
 }
 
 beforeAll(async () => {
-  logDir = mkdtempSync(join(tmpdir(), 'web-server-test-logs-'));
+  const temporaryLogDir = mkdtempSync(join(tmpdir(), 'web-server-test-logs-'));
+  // Plain realpathSync only resolves symlinks; .native also expands RUNNER~1.
+  // libuv's directory watcher otherwise aborts on short/long path mismatches:
+  // https://github.com/libuv/libuv/issues/5010
+  logDir = realpathSync.native(temporaryLogDir);
+  if (process.platform === 'win32' && process.env.CI) {
+    console.info('Windows log watcher paths', JSON.stringify({ input: temporaryLogDir, native: logDir }));
+  }
   web = createWebServer({ service: stubService(), token: TOKEN, logDir });
   const { port, url } = await web.listen(0); // 临时端口，起了就关，绝不占固定口
   base = `http://127.0.0.1:${port}`;
@@ -843,4 +852,27 @@ describe('web server · 日志', () => {
     expect(buf).toContain('data: {"event":"second-line"}');
     ac.abort();
   }, 10_000);
+});
+
+describe('voice settings HTTP boundary', () => {
+  it('requires authentication even for voice status', async () => {
+    expect((await get('/api/bots/cli_a/voice')).status).toBe(401);
+  });
+  it('returns diagnostics without credentials', async () => {
+    const res = await authed('/api/bots/cli_a/voice');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ enabled: false });
+  });
+  it('accepts enable/test and never echoes submitted secrets', async () => {
+    for (const body of [{ action: 'enable' }, { action: 'test' }, { action: 'disable' }, { action: 'refreshPermission' }]) {
+      const res = await authed('/api/bots/cli_a/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      expect(res.status).toBe(200); expect(await res.text()).not.toContain('private-key');
+    }
+  });
+  it('rejects removed provider configuration and unexpected operations before dispatch', async () => {
+    for (const body of [{ action: 'configureDoubao', credentials: {} }, { action: 'switchPlan', plan: 'free' }]) {
+      const res = await authed('/api/bots/cli_a/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      expect(res.status).toBe(400);
+    }
+  });
 });

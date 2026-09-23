@@ -249,3 +249,10 @@ describe('qrSvg —— 给定 url 出有效 SVG', () => {
     expect(pure.qrSvg('x', { size: 180 })).toContain('width="180"');
   });
 });
+
+
+it('parses every embedded browser script, including voice settings', () => {
+  for (const match of UI_HTML.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)) {
+    expect(() => new Function(match[1]!)).not.toThrow();
+  }
+});

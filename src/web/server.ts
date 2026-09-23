@@ -1,3 +1,4 @@
+import { validateVoiceAction } from '../voice/service';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, watch, type FSWatcher } from 'node:fs';
@@ -322,6 +323,31 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     if (req.method === 'GET' && setupMatch) {
       const status = await opts.service.getSetupStatus(decodeURIComponent(setupMatch[1]!));
       sendJson(res, 200, status);
+      return;
+    }
+
+    // Voice config stays in the owning bot process (also under supervisor IPC).
+    const voiceMatch = /^\/api\/bots\/([A-Za-z0-9_-]+)\/voice$/.exec(pathName);
+    if (voiceMatch && (req.method === 'GET' || req.method === 'POST')) {
+      const botId = voiceMatch[1]!;
+      if (req.method === 'GET') {
+        sendJson(res, 200, await opts.service.getVoice(botId));
+        return;
+      }
+      let action;
+      try { action = validateVoiceAction(await readJsonBody(req)); }
+      catch (err) {
+        sendJson(res, 400, { error: 'invalid_input', message: err instanceof Error ? err.message : '无效的语音设置' });
+        return;
+      }
+      try {
+        await opts.service.setVoice(botId, action);
+        sendJson(res, 200, { ok: true });
+      } catch (err) {
+        if (err instanceof NotWiredYetError) sendJson(res, 501, { error: 'not_wired_yet', message: err.message });
+        else if (err instanceof AdminWriteError) sendJson(res, 409, { error: 'write_rejected', message: err.message });
+        else sendJson(res, 500, { error: 'voice_failed', message: '语音设置失败，请检查机器人运行状态后重试' });
+      }
       return;
     }
 

@@ -1,3 +1,5 @@
+import { voiceView } from '../voice/view';
+import type { VoiceAction, VoiceView } from '../voice/types';
 import { readFile, rm } from 'node:fs/promises';
 import { loadBots, setActiveBots, removeBot } from '../config/bots';
 import { botPaths, botDir } from '../config/paths';
@@ -92,6 +94,8 @@ import type { AdminWriteOp } from './ops';
  * 切目录会把在跑 bot 的 paths 指到别的 bot（第一棒遗留的坑，本棒修掉）。
  */
 export interface AdminService {
+  getVoice(botId: string): Promise<VoiceView>;
+  setVoice(botId: string, action: VoiceAction): Promise<void>;
   /** 全部已注册 bot + 进程在跑状态（daemon 内 = 真实 WS 状态；预览 = 锁文件探测）。 */
   listBots(): Promise<AdminBot[]>;
   /** 某 bot 的项目列表（含话题数等聚合字段），对齐 DM 📁 项目列表。 */
@@ -525,6 +529,14 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
   }
 
   return {
+    async getVoice(botId: string): Promise<VoiceView> {
+      const cfg = await loadConfig(botPaths(botId).configFile);
+      if (!isComplete(cfg)) throw new Error('机器人配置不完整');
+      return voiceView(cfg);
+    },
+    async setVoice(botId: string, value: VoiceAction): Promise<void> {
+      await executeWrite(botId, '语音转文字', { kind: 'voice', value });
+    },
     async listBots(): Promise<AdminBot[]> {
       const reg = await loadBots();
       const configured = reg.bots.some((b) => b.active !== undefined);

@@ -107,6 +107,27 @@ describe('RunCardStream.streamElement — streaming_mode recovery', () => {
 describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
   afterEach(() => vi.useRealTimers());
 
+  it('serializes file-row updates with demotion and overlays the latest file state onto stale frames', async () => {
+    const ch = fakeChannel();
+    const elementUpdates: any[] = [];
+    ch.rawClient.cardkit.v1.cardElement.update = async (request: any) => { elementUpdates.push(request); return {}; };
+    const s = new RunCardStream();
+    const initial = card([{ tag: 'column_set', columns: [{ tag: 'column', elements: [
+      { tag: 'markdown', element_id: 'local_file_0', content: '获取并查看' },
+    ] }] }]);
+    await s.create(ch, 'oc_file_rows', initial, {});
+    expect(s.getCardId()).toBe('c_1');
+    const row = { tag: 'markdown', element_id: 'local_file_0', content: '查看文件' };
+    await Promise.all([
+      s.updateCard(ch, initial), // stale demotion was already queued
+      s.updateElement(ch, 'local_file_0', row),
+      s.updateCard(ch, initial),
+    ]);
+    expect(ch.updates.every((u: any) => u.data.includes('查看文件') && !u.data.includes('获取并查看'))).toBe(true);
+    expect(elementUpdates[0].data.sequence).toBeGreaterThan(ch.updates[0].sequence);
+    expect(ch.updates[1].sequence).toBeGreaterThan(elementUpdates[0].data.sequence);
+  });
+
   it('retries a rate-limited terminal update with exponential backoff until it lands', async () => {
     vi.useFakeTimers();
     // 两种限频形态都识别：HTTP 429（axios status）与业务码 99991400。
@@ -282,5 +303,88 @@ describe('per-chat 推送共享限速（M-4）', () => {
 
     expect(ch.updates).toHaveLength(2);
     expect(ch.updates[1].at - ch.updates[0].at).toBe(0); // 各自的桶，互不排队
+  });
+});
+
+it('streams only answer growth while preserving the native voice panel', async () => {
+  const { voiceReplyElements } = await import('../src/card/voice-reply');
+  const voice = { messageId: 'voice', text: '较长语音原文。'.repeat(100), transcribed: true };
+  const voiceFrame = (answer: string) => card([...voiceReplyElements([voice]), mdStream(answer, 'answer')], { streaming: true });
+  const ch = fakeChannel();
+  const stream = new RunCardStream();
+  await stream.create(ch, 'voice-stream-chat', voiceFrame('开始'), {});
+  stream.streamCoalesced(ch, voiceFrame('开始'), 'answer');
+  await stream.drain();
+  const before = ch.updates.length;
+  stream.streamCoalesced(ch, voiceFrame('开始，下面是很长的回答。'.repeat(100)), 'answer');
+  await stream.drain();
+  expect(ch.updates).toHaveLength(before);
+  expect(ch.contents).toHaveLength(1);
+  expect(ch.contents[0].content).not.toContain('语音');
+});
+
+describe('RunCardStream terminal icon transport', () => {
+  afterEach(() => vi.useRealTimers());
+  const iconFrame = (answer: string) => card([
+    { tag: 'markdown', content: 'Shell', icon: { tag: 'standard_icon', token: 'computer_outlined' } },
+    mdStream(answer, 'answer'),
+  ], { streaming: true });
+
+  it('serializes create, streaming, live, final and explicit updates while retaining dedup and typewriter growth', async () => {
+    vi.useFakeTimers();
+    const ch = fakeChannel();
+    const creates: string[] = [];
+    ch.rawClient.cardkit.v1.card.create = async (p: { data: { data: string } }) => {
+      creates.push(p.data.data);
+      return { data: { card_id: 'c_icons' } };
+    };
+    const upload = vi.fn().mockResolvedValue({ data: { image_key: 'img_terminal' } });
+    ch.rawClient.im.v1.image = { create: upload };
+    const s = new RunCardStream();
+    await s.create(ch, 'oc_icon_paths', iconFrame('hello'), {});
+    s.streamCoalesced(ch, iconFrame('hello'), 'answer');
+    await s.drain();
+    expect(ch.updates).toHaveLength(0);
+    s.streamCoalesced(ch, iconFrame('hello world'), 'answer');
+    await s.drain();
+    expect(ch.contents).toHaveLength(1);
+    for (const [method, text] of [
+      ['streamCard', 'stream'], ['updateLiveCard', 'live'],
+      ['finalizeCard', 'final'], ['updateCard', 'explicit'],
+    ] as const) {
+      const pending = s[method](ch, iconFrame(text));
+      await vi.runAllTimersAsync();
+      expect(await pending).toBe(true);
+    }
+    expect(ch.updates).toHaveLength(4);
+    for (const data of [...creates, ...ch.updates.map((u: { data: string }) => u.data)]) {
+      expect(data).toContain('"tag":"custom_icon","img_key":"img_terminal"');
+      expect(data).not.toContain('computer_outlined');
+    }
+    expect(upload).toHaveBeenCalledTimes(1);
+  });
+
+  it('queues forced frames in invocation order and captures them before the first icon upload resolves', async () => {
+    vi.useFakeTimers();
+    const ch = fakeChannel();
+    let finish!: (response: unknown) => void;
+    ch.rawClient.im.v1.image = { create: vi.fn(() => new Promise(resolve => { finish = resolve; })) };
+    const s = new RunCardStream();
+    await s.create(ch, 'oc_icon_order', frame('initial'), {});
+    const live = iconFrame('live');
+    const first = s.updateLiveCard(ch, live);
+    const final = s.finalizeCard(ch, iconFrame('final'));
+    Object.assign(live, frame('mutated after enqueue'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ch.updates).toHaveLength(0);
+    finish({ data: { image_key: 'img_terminal' } });
+    await vi.runAllTimersAsync();
+    expect(await first).toBe(true);
+    expect(await final).toBe(true);
+    expect(ch.updates).toHaveLength(2);
+    expect(ch.updates[0].data).toContain('"content":"live"');
+    expect(ch.updates[1].data).toContain('"content":"final"');
+    expect(ch.updates[0].sequence).toBeLessThan(ch.updates[1].sequence);
+    expect(ch.updates[0].data).not.toContain('mutated after enqueue');
   });
 });
