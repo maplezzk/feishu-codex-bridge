@@ -98,6 +98,21 @@ function visit(node: unknown, out: string[]): void {
   pushDirectLeaf(obj, out);
   visitDirectChildren(obj, out);
 
+  // Interactive alert cards often put their entire payload in a native table.
+  // Table cells are plain strings or text/value objects under `rows[].cells[]`,
+  // rather than markdown `content`; the generic card walker intentionally
+  // ignores those fields to avoid treating arbitrary IDs/config as user text.
+  // Handle that schema only when the node is explicitly a table.
+  if (obj.tag === 'table') {
+    const table = obj.property && typeof obj.property === 'object'
+      ? obj.property as Record<string, unknown>
+      : obj;
+    for (const key of ['columns', 'rows', 'cells', 'data']) {
+      const value = table[key] ?? obj[key];
+      if (value != null) visitTableText(value, out);
+    }
+  }
+
   const prop = obj.property as Record<string, unknown> | undefined;
   if (!prop) return;
 
@@ -171,6 +186,8 @@ function visitDirectChildren(obj: Record<string, unknown>, out: string[]): void 
     'columns',
     'actions',
     'fields',
+    'rows',
+    'cells',
     'content',
   ]) {
     const value = obj[key];
@@ -187,6 +204,29 @@ function visitDirectChildren(obj: Record<string, unknown>, out: string[]): void 
       continue;
     }
     if (value != null) visit(value, out);
+  }
+}
+
+/** Read only human-readable cell fields from a native table node. */
+function visitTableText(node: unknown, out: string[]): void {
+  if (typeof node === 'string') {
+    if (node.trim()) out.push(node);
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const child of node) visitTableText(child, out);
+    return;
+  }
+  if (!node || typeof node !== 'object') return;
+  const obj = node as Record<string, unknown>;
+  for (const key of ['name', 'title', 'text', 'content', 'value', 'display_value', 'label']) {
+    const value = obj[key];
+    if (typeof value === 'string' && value.trim()) out.push(value);
+    else if (value && typeof value === 'object') visitTableText(value, out);
+  }
+  for (const key of ['rows', 'cells', 'columns', 'data', 'items', 'elements', 'children', 'property']) {
+    const value = obj[key];
+    if (value != null) visitTableText(value, out);
   }
 }
 
@@ -226,7 +266,7 @@ function collectCardParts(jsonCard: unknown): { all: string[]; title: string[]; 
     hasBody = true;
     visit(root.body, bodyRaw);
   } else if (root) {
-    for (const key of ['elements', 'content', 'columns', 'actions', 'fields', 'label', 'placeholder', 'options', 'text']) {
+    for (const key of ['elements', 'content', 'columns', 'rows', 'cells', 'data', 'table', 'actions', 'fields', 'label', 'placeholder', 'options', 'text']) {
       if (root[key] == null) continue;
       hasBody = true;
       visit(root[key], bodyRaw);

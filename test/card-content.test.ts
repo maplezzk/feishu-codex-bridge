@@ -238,6 +238,34 @@ describe('assessRawCardContent / fetchInteractiveCardContent', () => {
     });
   });
 
+  it('reads native table rows and cells from an alert card', () => {
+    const result = assessRawCardContent({
+      header: { title: { tag: 'plain_text', content: 'OMS和ERP订单状态不一致报警' } },
+      body: {
+        elements: [{
+          tag: 'table',
+          columns: [
+            { name: 'erp订单号' },
+            { name: '订单明细更新sql' },
+            { name: '订单状态更新sql' },
+            { name: '下单时间' },
+          ],
+          rows: [{ cells: [
+            { text: '132475108' },
+            { text: 'update order_detail set package_id = 37728751 where erp_order_detail_id in (787320316);' },
+            { text: 'update order set logistics_status = 2 where erp_order_id = 132475108;' },
+            { text: '2026-08-12 10:55:02' },
+          ] }],
+        }],
+      },
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.text).toContain('132475108');
+    expect(result.text).toContain('update order_detail set package_id = 37728751');
+    expect(result.text).toContain('2026-08-12 10:55:02');
+  });
+
   it('marks a direct card with a readable body as complete', () => {
     expect(
       assessRawCardContent({
