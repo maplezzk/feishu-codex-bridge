@@ -503,6 +503,52 @@ function modelEl(rc: RunCardState): CardElement | null {
   };
 }
 
+/**
+ * 「上游无响应，自动重试中」状态卡 —— 看门狗判死之后的唯一可见面。
+ *
+ * 背景：上游 responses 流偶发长时间一条数据都不发（codex 侧既不报错也不超时，
+ * 9/28 实测同一 thread 连续 4 段静默 237/476/266/501 秒，全部停在
+ * receiving_stream，期间没有任何未闭合工具调用），bridge 的「N 分钟无任何通知」
+ * 看门狗先到点把这一轮判死。用户原话是「挂了都不知道」——所以重试必须可见：
+ * 这张卡原地更新（第 k/N 次、还要等多久），并带一个 ⏹ 停止重试。
+ *
+ * phase:
+ *  - waiting  等待退避结束（带 ⏹ 停止重试）
+ *  - started  第 k 次重试已发起（收掉按钮，⏹ 交给新一轮的 run 卡）
+ *  - stopped  用户点了 ⏹，重试序列到此为止
+ */
+export function buildRetryCard(opts: {
+  attempt: number;
+  maxAttempts: number;
+  /** 距离下次尝试的等待秒数 */
+  delaySeconds: number;
+  /** 这一轮被掐前，上游静默了多少秒（看门狗阈值） */
+  idleSeconds: number;
+  /** 这一轮为什么被掐 */
+  reason: 'watchdog-timeout' | 'proc-dead';
+  phase: 'waiting' | 'started' | 'stopped';
+  /** 自指按钮的路由键（自己的 messageId）；缺省时 handle-message 回落到 evt.messageId */
+  cardKey?: string;
+}): CardObject {
+  const cause =
+    opts.reason === 'watchdog-timeout'
+      ? `上一轮 **${opts.idleSeconds} 秒**没有任何响应，已自动终止（会话保留）`
+      : '上一轮的 Codex 进程意外退出，已自动回收（会话保留）';
+  const body =
+    opts.phase === 'waiting'
+      ? `${cause}\n🔄 **${opts.delaySeconds} 秒后**进行第 **${opts.attempt}/${opts.maxAttempts}** 次重试（间隔逐步拉长，最长 1 分钟一次）`
+      : opts.phase === 'started'
+        ? `${cause}\n▶️ 第 **${opts.attempt}/${opts.maxAttempts}** 次重试已发起…`
+        : `${cause}\n⏹ 已按你的要求停止重试（第 **${opts.attempt}/${opts.maxAttempts}** 次）。会话和已产出的内容都在。`;
+  const els: CardElement[] = [md(body)];
+  if (opts.phase === 'waiting') {
+    els.push(actions([button('⏹ 停止重试', { a: RC.stop, m: opts.cardKey ?? '' }, 'default')], CONTROLS_EID));
+  }
+  return card(els, {
+    summary: opts.phase === 'waiting' ? '自动重试中' : opts.phase === 'started' ? '重试已发起' : '已停止重试',
+  });
+}
+
 function summaryText(state: RunState): string {
   if (state.terminal === 'interrupted') return '已中断';
   if (state.terminal === 'idle_timeout') return '已超时';

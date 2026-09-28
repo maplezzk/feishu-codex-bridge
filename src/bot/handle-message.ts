@@ -93,6 +93,7 @@ import { buildHistoryCard, type HistoryCardState } from '../card/history-card';
 import {
   ANSWER_EID,
   buildQueuedCard,
+  buildRetryCard,
   buildRunCard,
   buildRunCardPlain,
   CONTROLS_EID,
@@ -254,6 +255,7 @@ import {
   syncCommentInstructions,
 } from './comments';
 import { createGracefulInterrupt, Semaphore, withIdleTimeout } from './watchdog';
+import { decideAutoRetry } from './auto-retry';
 
 /**
  * open_id → 姓名 的批量解析（管理员 / 白名单卡展示用）。需 contact:user.base:readonly
@@ -4222,7 +4224,11 @@ export function createOrchestrator(
     reaction?: RunReaction,
     onTopicCreated?: () => void,
   ): Promise<void> {
-    if (shuttingDown) { await opts.thread.close(); return; }
+    // 本轮实际使用的 codex 线程句柄。自动重试会把被看门狗杀掉的进程换成
+    // resolveThread 重新解析出来的新句柄，所以这里必须是可变的（见下方
+    // 「auto-retry」段）。
+    let thread = opts.thread;
+    if (shuttingDown) { await thread.close(); return; }
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
     // The turn's workspace: resolves relative image refs in the reply and is what
@@ -4231,10 +4237,10 @@ export function createOrchestrator(
     // Reuse the reservation handleTurn made for this session (so messages
     // queued during startup aren't lost); fall back to a fresh state otherwise.
     const state: ActiveState = active.get(activeKey) ?? { queue: [], requesterOpenId: opts.requesterOpenId };
-    state.thread = opts.thread;
+    state.thread = thread;
     if (opts.requesterOpenId) state.requesterOpenId = opts.requesterOpenId;
     active.set(activeKey, state);
-    if (opts.knownThreadId) trackSession(opts.knownThreadId, opts.thread);
+    if (opts.knownThreadId) trackSession(opts.knownThreadId, thread);
 
     // M-3: 池满先排队（占位卡可见可取消）；null = 等待期被 ⏹ 取消，预订已释放。
     const slot = await acquireRunSlot(opts, state, activeKey, reaction);
@@ -4242,7 +4248,7 @@ export function createOrchestrator(
     if (shuttingDown) {
       slot.release();
       active.delete(activeKey);
-      await opts.thread.close();
+      await thread.close();
       return;
     }
     const { release } = slot;
@@ -4308,7 +4314,7 @@ export function createOrchestrator(
         threadId,
         chatId: opts.chatId,
         cwd: runCwd,
-        sessionId: opts.thread.sessionId,
+        sessionId: thread.sessionId,
         backend: opts.backendId ?? DEFAULT_BACKEND_ID,
         titleJobKey: opts.titleJobKey,
         model: opts.model,
@@ -4353,6 +4359,9 @@ export function createOrchestrator(
       };
       let replyTo = opts.replyTo;
       let replyInThread = opts.flat ? false : (opts.replyInThread ?? Boolean(opts.knownThreadId));
+      // 自动重试的跨轮状态：这是第几次重试、以及那张原地更新的「自动重试中」卡。
+      let retryAttempt = 0;
+      let retryCardMsgId: string | undefined;
       for (;;) {
         const turnInput = currentTurn.input;
         state.requesterOpenId = currentTurn.requesterOpenId;
@@ -4374,7 +4383,7 @@ export function createOrchestrator(
         const turnModel = rec?.model ?? opts.model;
         const turnEffort = rec?.effort ?? opts.effort;
         const modelDisp = getModelDisplay(cfg);
-        const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
+        const run = thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort });
         titleTurnAttempted = true;
         const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
         state.run = run;
@@ -4409,7 +4418,7 @@ export function createOrchestrator(
               const key = opts.roleSuffix ? `${tid}#${opts.roleSuffix}` : tid;
               active.delete(activeKey);
               active.set(key, state);
-              trackSession(key, opts.thread);
+              trackSession(key, thread);
               activeKey = key;
               topicThreadId = key;
               rc.threadId = key;
@@ -4472,8 +4481,8 @@ export function createOrchestrator(
           // （事件尚未消费），abort 仅尽力而为；close() SIGKILL 子进程兜底终结
           // 这轮。下一条消息经 resolveThread 的 resume 兜底自愈。
           const tid = run.turnId();
-          if (tid) void opts.thread.abort(tid).catch(() => undefined);
-          void opts.thread.close().catch(() => undefined);
+          if (tid) void thread.abort(tid).catch(() => undefined);
+          void thread.close().catch(() => undefined);
           if (topicThreadId) sessions.delete(topicThreadId);
           throw err; // 外层 catch 把错误回给用户
         }
@@ -4586,7 +4595,7 @@ export function createOrchestrator(
         });
         const stopper = createGracefulInterrupt({
           turnId: () => run.turnId(),
-          abort: (tid) => void opts.thread.abort(tid).catch(() => undefined),
+          abort: (tid) => void thread.abort(tid).catch(() => undefined),
           forceStop: resolveStop,
         });
         disposeInterrupt = stopper.dispose;
@@ -4672,9 +4681,9 @@ export function createOrchestrator(
         // finalizing: a dead process or poisoned collaboration registry becomes
         // an error instead of a false success; a clean backend terminal remains
         // authoritative when no protocol fault was observed.
-        const procDead = !killed && !opts.thread.isAlive();
-        const protocolFault = opts.thread.needsRecycle?.()
-          ? opts.thread.recycleReason?.() ?? 'Codex 协作状态已失步'
+        const procDead = !killed && !thread.isAlive();
+        const protocolFault = thread.needsRecycle?.()
+          ? thread.recycleReason?.() ?? 'Codex 协作状态已失步'
           : undefined;
         settleOrdinaryTurnRender(render, {
           interrupted,
@@ -4699,7 +4708,7 @@ export function createOrchestrator(
         // 直接经 resolveThread 的 resume 兜底自愈（快路径的健康检查是兜底的兜底）。
         const recycle = killed || procDead || Boolean(protocolFault);
         if (recycle) {
-          void opts.thread.close().catch(() => undefined);
+          void thread.close().catch(() => undefined);
           if (topicThreadId) sessions.delete(topicThreadId);
           // 自愈观测：这里是「kill 中途死」唯一的驱逐点且原先静默——进程死在轮中
           // 时 LIVE 缓存在本轮收尾就清掉，下一条消息的 resolveThread 不会再命中
@@ -4809,6 +4818,152 @@ export function createOrchestrator(
         replyInThread = !opts.flat; // stay in the topic for queued turns (single: stay flat)
         log.info('card', 'final', { terminal: render.terminal() });
 
+        // ── auto-retry：上游静默被看门狗判死后**整轮重发**，不是直接挂掉 ──────
+        // 用户诉求原话「断了别直接挂，一直重试」「20s 一次」「最多 100 次」。
+        //
+        // 只对**看门狗超时**（timedOut = 上游 N 分钟一条通知都不发）重试：那是
+        // codex 自己既收不到 EOF 也不报错、只会干等的场景，重发是唯一出路。
+        // 子进程猝死（procDead）**故意不在这里重试** —— 那条路径已经有一套语义
+        // （轮中死 → 驱逐缓存；排队消息遇 UnsentRequestError → 换新线程重投，
+        // 见 test/message-queue-races「resubmits a definitely unsent message…」），
+        // 在这里再插一手会把那个重投整个吃掉。
+        //
+        // 用户按了 ⏹、或协作协议已失步，都不重试（重试白搭）。重试期间发一张
+        // 可见的状态卡（第 k/100 次 + 还要等多久 + ⏹ 停止重试），用户「挂了都
+        // 不知道」的问题就落在它身上。线程已在本轮收尾时 close + 驱逐缓存，所以
+        // 重发前先 resolveThread 从持久化线程 resume 出来接着跑。
+        if (!interrupted && topicThreadId && timedOut) {
+          const decision = decideAutoRetry({
+            timedOut,
+            procDead,
+            interrupted,
+            protocolFault,
+            attempt: retryAttempt + 1,
+            canResume: true,
+          });
+          if (!decision.retry) {
+            log.info('agent', 'auto-retry-skip', {
+              threadId: topicThreadId,
+              reason: decision.reason,
+              attempt: retryAttempt + 1,
+              idleSeconds: Math.round(idleMs / 1000),
+              protocolFault: protocolFault ?? null,
+            });
+            if (decision.reason === 'exhausted') {
+              await channel
+                .send(
+                  opts.chatId,
+                  {
+                    markdown: `⚠️ 上游连续无响应，已自动重试 ${retryAttempt} 次仍未恢复，本轮放弃。会话与已产出的内容都在，可以直接再发一条消息继续。`,
+                  },
+                  { replyTo: finalMsgId, replyInThread: !opts.flat },
+                )
+                .catch((err) => log.fail('card', err, { phase: 'auto-retry-exhausted' }));
+            }
+          } else {
+            retryAttempt = decision.attempt;
+            const idleSeconds = Math.round(idleMs / 1000);
+            const retryView = (phase: 'waiting' | 'started' | 'stopped') =>
+              buildRetryCard({
+                attempt: retryAttempt,
+                maxAttempts: decision.maxAttempts,
+                delaySeconds: Math.round(decision.delayMs / 1000),
+                idleSeconds,
+                reason: 'watchdog-timeout',
+                phase,
+              });
+            log.info('agent', 'auto-retry', {
+              threadId: topicThreadId,
+              attempt: retryAttempt,
+              maxAttempts: decision.maxAttempts,
+              delayMs: decision.delayMs,
+              idleSeconds,
+              reason: 'watchdog-timeout',
+            });
+            try {
+              if (retryCardMsgId) {
+                await updateManagedCard(channel, retryCardMsgId, retryView('waiting'));
+              } else {
+                const sent = await sendManagedCard(channel, opts.chatId, retryView('waiting'), finalMsgId, !opts.flat);
+                retryCardMsgId = sent.messageId;
+              }
+            } catch (err) {
+              log.fail('card', err, { phase: 'auto-retry-card' });
+            }
+            // 等待退避：期间 ⏹ 走 RC.stop → runsByCard → state.interrupt，能立刻打断。
+            let stopWaiting = false;
+            let wakeWait: (() => void) | undefined;
+            const waitEnd = new Promise<void>((res) => {
+              wakeWait = res;
+            });
+            const waitTimer = setTimeout(() => wakeWait?.(), decision.delayMs);
+            if (retryCardMsgId) {
+              runsByCard.set(retryCardMsgId, state);
+              state.interrupt = () => {
+                stopWaiting = true;
+                wakeWait?.();
+              };
+            }
+            await waitEnd;
+            clearTimeout(waitTimer);
+            state.interrupt = undefined;
+            if (retryCardMsgId) runsByCard.delete(retryCardMsgId);
+            if (stopWaiting) {
+              log.info('agent', 'auto-retry-stopped', {
+                threadId: topicThreadId,
+                attempt: retryAttempt,
+              });
+              if (retryCardMsgId) {
+                void updateManagedCard(channel, retryCardMsgId, retryView('stopped')).catch((err) =>
+                  log.fail('card', err, { phase: 'auto-retry-card-stopped' }),
+                );
+              }
+              // 落到下面的 recycle 收尾：丢掉排队消息并结束这一轮。
+            } else {
+              if (retryCardMsgId) {
+                void updateManagedCard(channel, retryCardMsgId, retryView('started')).catch((err) =>
+                  log.fail('card', err, { phase: 'auto-retry-card-started' }),
+                );
+              }
+              const retryProject = await getProjectByChatId(opts.chatId);
+              const retryPerm = turnPerm(
+                retryProject ?? undefined,
+                currentTurn.requesterOpenId ?? opts.requesterOpenId ?? '',
+              );
+              const { thread: resumed } = await resolveThread(topicThreadId, opts.chatId, {
+                mode: retryPerm.mode ?? opts.mode,
+                network: retryPerm.network,
+                autoCompact: retryPerm.autoCompact,
+              });
+              if (!resumed) {
+                log.warn('agent', 'auto-retry-no-session', {
+                  threadId: topicThreadId,
+                  attempt: retryAttempt,
+                });
+                await channel
+                  .send(
+                    opts.chatId,
+                    {
+                      markdown: `⚠️ 第 ${retryAttempt} 次自动重试失败：这个会话恢复不出来（记录缺失或后端未起来）。会话记录没动，重发一条消息即可继续。`,
+                    },
+                    { replyTo: finalMsgId, replyInThread: !opts.flat },
+                  )
+                  .catch((err) => log.fail('card', err, { phase: 'auto-retry-no-session' }));
+              } else {
+                thread = resumed;
+                state.thread = resumed;
+                firstRec = undefined; // 重试不是首轮：model/effort 重读持久化记录
+                log.info('agent', 'auto-retry-resume', {
+                  threadId: topicThreadId,
+                  sessionId: resumed.sessionId,
+                  attempt: retryAttempt,
+                });
+                continue; // 同一轮输入整轮重发
+              }
+            }
+          }
+        }
+
         // A stop (⏹ graceful or forced / watchdog) or a dead process ends the
         // whole run — drop any queued follow-ups, but tell the user instead of
         // swallowing them. 优雅 ⏹ 虽然线程留用，但用户按了停就是要停：排队消息
@@ -4849,8 +5004,8 @@ export function createOrchestrator(
       state.interrupt = undefined;
       // A stream/card failure can leave an agent turn running. Retire that
       // client before the next message resumes the persisted session.
-      if (topicThreadId && sessions.get(topicThreadId) === opts.thread) sessions.delete(topicThreadId);
-      await opts.thread.close().catch(() => undefined);
+      if (topicThreadId && sessions.get(topicThreadId) === thread) sessions.delete(topicThreadId);
+      await thread.close().catch(() => undefined);
       log.fail('intake', err);
       await channel
         .send(opts.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
@@ -4871,7 +5026,7 @@ export function createOrchestrator(
       // ——保活只会把常驻 agent 进程（~172MB/个）泄漏到停机。与 goal 路径
       // 一致直接回收（close 幂等，已死/已关的也无害）。
       if (activeKey.startsWith('pending:')) {
-        void opts.thread.close().catch(() => undefined);
+        void thread.close().catch(() => undefined);
         log.warn('intake', 'unadopted-thread-closed', { activeKey });
       }
       reaction?.done(); // run ended (complete / ⏹ / timeout / error) → ✅ DONE
