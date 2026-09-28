@@ -212,8 +212,8 @@ import {
 } from './session-title';
 import { handleDmConsole } from './dm-console';
 import {
+  cardTextForAgent,
   fetchInteractiveCardContent,
-  isLikelyIncompleteCardText,
 } from './card-content';
 import { appendIncompleteContentNotice } from './inbound-content';
 import {
@@ -990,11 +990,8 @@ export function createOrchestrator(
     if (msg.rawContentType === 'interactive') {
       const before = msg.content;
       const card = await fetchInteractiveCardContent(channel, msg.messageId);
-      if (card.text && (card.complete || isLikelyIncompleteCardText(before))) {
-        msg.content = card.text;
-      }
-      if (!card.complete && isLikelyIncompleteCardText(before)) {
-        msg.content = appendIncompleteContentNotice(msg.content, 'interactive-card', card.text);
+      msg.content = cardTextForAgent(before, card);
+      if (!card.complete) {
         log.warn('intake', 'card-content-incomplete', {
           msgId: msg.messageId,
           reason: card.reason ?? 'unknown',

@@ -1,5 +1,6 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
+import { appendIncompleteContentNotice } from './inbound-content';
 
 /**
  * Recover the real text of an `interactive` (card 2.0) message that Feishu
@@ -49,7 +50,8 @@ export type InteractiveCardReadReason =
   | 'empty-response'
   | 'malformed-response'
   | 'title-only'
-  | 'body-unreadable';
+  | 'body-unreadable'
+  | 'table-unreadable';
 
 /** Result of reading a card source.  `complete=false` is deliberately
  * explicit: a non-empty title is not evidence that the card body was read. */
@@ -87,6 +89,13 @@ function visit(node: unknown, out: string[]): void {
   if (typeof node !== 'object') return;
   const obj = node as Record<string, unknown>;
 
+  // Table children need their column definitions to interpret row keys. The
+  // generic walker would emit bare cell values and lose their relationships.
+  if (obj.tag === 'table') {
+    visitTable(obj, out);
+    return;
+  }
+
   // Top-level containers (header first so the card title leads the body).
   if (obj.header) visit(obj.header, out);
   if (obj.body) visit(obj.body, out);
@@ -97,21 +106,6 @@ function visit(node: unknown, out: string[]): void {
   // card to its header title.  Read the direct send-format shape as well.
   pushDirectLeaf(obj, out);
   visitDirectChildren(obj, out);
-
-  // Interactive alert cards often put their entire payload in a native table.
-  // Table cells are plain strings or text/value objects under `rows[].cells[]`,
-  // rather than markdown `content`; the generic card walker intentionally
-  // ignores those fields to avoid treating arbitrary IDs/config as user text.
-  // Handle that schema only when the node is explicitly a table.
-  if (obj.tag === 'table') {
-    const table = obj.property && typeof obj.property === 'object'
-      ? obj.property as Record<string, unknown>
-      : obj;
-    for (const key of ['columns', 'rows', 'cells', 'data']) {
-      const value = table[key] ?? obj[key];
-      if (value != null) visitTableText(value, out);
-    }
-  }
 
   const prop = obj.property as Record<string, unknown> | undefined;
   if (!prop) return;
@@ -207,10 +201,72 @@ function visitDirectChildren(obj: Record<string, unknown>, out: string[]): void 
   }
 }
 
-/** Read only human-readable cell fields from a native table node. */
+function tableProperty(node: Record<string, unknown>): Record<string, unknown> {
+  return node.property && typeof node.property === 'object' && !Array.isArray(node.property)
+    ? { ...node, ...(node.property as Record<string, unknown>) }
+    : node;
+}
+
+function tableColumns(table: Record<string, unknown>): Record<string, unknown>[] {
+  return Array.isArray(table.columns)
+    ? table.columns.filter((column): column is Record<string, unknown> =>
+      column !== null && typeof column === 'object' && !Array.isArray(column))
+    : [];
+}
+
+function tableRowCells(row: unknown, columns: Record<string, unknown>[]): unknown[] {
+  if (Array.isArray(row)) return row;
+  if (!row || typeof row !== 'object') return [];
+  const values = row as Record<string, unknown>;
+  if (values.cells != null) return tableRowCells(values.cells, columns);
+  if (columns.length) {
+    return columns.map((column, index) => values[String(column.name ?? index)]);
+  }
+  return Object.keys(values)
+    .filter((key) => /^\d+$/.test(key))
+    .sort((a, b) => Number(a) - Number(b))
+    .map((key) => values[key]);
+}
+
+function tableColumnTitle(column: Record<string, unknown>, index: number): string {
+  const label: string[] = [];
+  visitTableText(column.displayName || column.title || column.label, label);
+  if (label.length) return label.join(' ');
+  const name = typeof column.name === 'string' ? column.name.trim() : '';
+  return name && !/^\d+$/.test(name) ? name : `第${index + 1}列`;
+}
+
+function visitTable(node: Record<string, unknown>, out: string[]): void {
+  const table = tableProperty(node);
+  const columns = tableColumns(table);
+  const headers = columns.map(tableColumnTitle);
+  if (Array.isArray(table.rows)) {
+    for (const [rowIndex, row] of table.rows.entries()) {
+      const entries = tableRowCells(row, columns).map((cell, index) => {
+        const pieces: string[] = [];
+        visitTableText(cell, pieces);
+        return `${headers[index] ?? `第${index + 1}列`}：${uniqueLines(pieces).join(' ') || '（空）'}`;
+      });
+      if (entries.length) out.push(`表格第${rowIndex + 1}行：${entries.join('；')}`);
+    }
+  } else {
+    for (const key of ['cells', 'data']) {
+      if (table[key] == null) continue;
+      const pieces: string[] = [];
+      visitTableText(table[key], pieces);
+      if (pieces.length) out.push(`表格内容：${uniqueLines(pieces).join('；')}`);
+    }
+  }
+  if (!Array.isArray(table.rows) || table.rows.length === 0) {
+    if (headers.length) out.push(`表格列：${headers.join('；')}`);
+  }
+}
+
+/** Read only human-readable fields from a cell, including nested markdown. */
 function visitTableText(node: unknown, out: string[]): void {
-  if (typeof node === 'string') {
-    if (node.trim()) out.push(node);
+  if (typeof node === 'string' || typeof node === 'number' || typeof node === 'boolean') {
+    const value = String(node).trim();
+    if (value) out.push(value);
     return;
   }
   if (Array.isArray(node)) {
@@ -219,15 +275,42 @@ function visitTableText(node: unknown, out: string[]): void {
   }
   if (!node || typeof node !== 'object') return;
   const obj = node as Record<string, unknown>;
-  for (const key of ['name', 'title', 'text', 'content', 'value', 'display_value', 'label']) {
+  for (const key of ['title', 'text', 'content', 'value', 'displayValue', 'display_value', 'label']) {
     const value = obj[key];
-    if (typeof value === 'string' && value.trim()) out.push(value);
-    else if (value && typeof value === 'object') visitTableText(value, out);
+    if (value != null) visitTableText(value, out);
   }
   for (const key of ['rows', 'cells', 'columns', 'data', 'items', 'elements', 'children', 'property']) {
     const value = obj[key];
     if (value != null) visitTableText(value, out);
   }
+}
+
+/** A visible table row with missing or opaque cells is partial input, even if
+ * the card also has a readable title and description. */
+function hasUnreadableTable(node: unknown): boolean {
+  if (Array.isArray(node)) return node.some(hasUnreadableTable);
+  if (!node || typeof node !== 'object') return false;
+  const obj = node as Record<string, unknown>;
+  if (obj.tag === 'table') {
+    const table = tableProperty(obj);
+    if (table.rows != null && !Array.isArray(table.rows)) return true;
+    const rows = Array.isArray(table.rows) ? table.rows : [];
+    const columns = tableColumns(table);
+    if (rows.length && table.columns != null && !Array.isArray(table.columns)) return true;
+    if (rows.length && !columns.length) return true;
+    for (const row of rows) {
+      const cells = tableRowCells(row, columns);
+      if (!cells.length || (columns.length && cells.length < columns.length)) return true;
+      for (const cell of cells) {
+        if (cell === undefined) return true;
+        if (cell === null || cell === '') continue;
+        const text: string[] = [];
+        visitTableText(cell, text);
+        if (!text.length) return true;
+      }
+    }
+  }
+  return Object.values(obj).some(hasUnreadableTable);
 }
 
 function readUrl(value: unknown): string | undefined {
@@ -244,7 +327,7 @@ function uniqueLines(out: string[]): string[] {
   const lines: string[] = [];
   for (const piece of out) {
     const key = piece.trim();
-    if (!key || seen.has(key)) continue;
+    if (!key || (!key.startsWith('表格第') && seen.has(key))) continue;
     seen.add(key);
     lines.push(key);
   }
@@ -290,6 +373,8 @@ export function assessRawCardContent(jsonCard: unknown): InteractiveCardContent 
   const text = parts.all.join('\n').trim();
   if (!text) return { complete: false, reason: 'body-unreadable' };
 
+  if (hasUnreadableTable(jsonCard)) return { text, complete: false, reason: 'table-unreadable' };
+
   const title = parts.title.join('\n').trim();
   const body = parts.body.join('\n').trim();
   if (!body || (title && text === title)) {
@@ -306,6 +391,15 @@ export function isLikelyIncompleteCardText(content: string): boolean {
   if (isDegradedCardContent(t)) return true;
   if (!t || t === '[卡片消息]') return true;
   return !t.includes('\n') && !/https?:\/\//i.test(t) && !/^\[按钮：/.test(t);
+}
+
+/** Keep the best visible text while making every failed raw-card read explicit
+ * to the agent, including cards whose preview already contains several lines. */
+export function cardTextForAgent(before: string, card: InteractiveCardContent): string {
+  const text = card.text && (card.complete || isLikelyIncompleteCardText(before)) ? card.text : before;
+  return card.complete
+    ? text
+    : appendIncompleteContentNotice(text, 'interactive-card', card.text, { partialReadable: Boolean(text.trim()) });
 }
 
 /**
