@@ -3,11 +3,11 @@ import type { AgentUserInputQuestion, AgentUserInputRequest } from '../agent/typ
 import {
   actions,
   card,
+  columns,
   form,
   hr,
   input,
   md,
-  note,
   selectMenu,
   submitButton,
   type CardElement,
@@ -98,7 +98,6 @@ const COPY: Record<UserInputLocale, {
   instructions: string;
   choose: string;
   customOptional: string;
-  customRequired: string;
   customPlaceholder: string;
   submit: string;
   submitting: string;
@@ -123,10 +122,9 @@ const COPY: Record<UserInputLocale, {
 }> = {
   zh: {
     title: 'Codex 需要你的回答',
-    instructions: '请完整回答下面的问题，再提交。选项不会自动选择；需要自填时，以自填内容为准。',
+    instructions: '每题选择或填写答案后提交，自填内容优先。',
     choose: '请选择',
-    customOptional: '自填答案（优先使用，可选）',
-    customRequired: '自填答案',
+    customOptional: '其他答案（可选）',
     customPlaceholder: '输入你的答案',
     submit: '✅ 提交回答',
     submitting: '⏳ 正在提交回答…',
@@ -151,10 +149,9 @@ const COPY: Record<UserInputLocale, {
   },
   en: {
     title: 'Codex needs your answer',
-    instructions: 'Answer every question before submitting. No option is preselected; custom text takes precedence when provided.',
+    instructions: 'Choose or type an answer for each question. Typed answers take precedence.',
     choose: 'Choose an option',
-    customOptional: 'Custom answer (takes precedence, optional)',
-    customRequired: 'Custom answer',
+    customOptional: 'Other answer (optional)',
     customPlaceholder: 'Type your answer',
     submit: '✅ Submit answer',
     submitting: '⏳ Submitting answer…',
@@ -203,10 +200,6 @@ function optionDisplay(option: { label: string; description: string }): string {
   return option.description ? `${option.label} — ${option.description}` : option.label;
 }
 
-function questionNumber(index: number, total: number): string {
-  return total > 1 ? `${index + 1}. ` : '';
-}
-
 function answerLines(
   questions: AgentUserInputQuestion[],
   answers: UserInputAnswers | undefined,
@@ -239,7 +232,7 @@ export function buildUserInputCard(opts: UserInputCardOptions): CardObject {
   }
 
   const status = opts.status ?? 'pending';
-  const common = [md(`❓ **${text.title}**`)];
+  const common: CardElement[] = [];
   if (status === 'pending') {
     common.push(md(text.instructions));
   } else if (status === 'submitting') {
@@ -264,15 +257,11 @@ export function buildUserInputCard(opts: UserInputCardOptions): CardObject {
 
   const formElements: CardElement[] = [];
   for (const [index, question] of opts.questions.entries()) {
-    const prefix = questionNumber(index, opts.questions.length);
-    formElements.push(md(`**${prefix}${question.header}**`));
     formElements.push(md(question.question));
+    const fields: CardElement[] = [];
 
     if (hasOptions(question)) {
-      // Keep the full descriptions visible even on clients that truncate the
-      // select's plain-text option label.
-      formElements.push(note(question.options.map((option, optionIndex) => `${optionIndex + 1}. ${optionDisplay(option)}`).join('\n')));
-      formElements.push(selectMenu({
+      fields.push({ ...selectMenu({
         name: questionField(index),
         placeholder: text.choose,
         // Values are indexes, never labels. The service resolves them against
@@ -281,21 +270,22 @@ export function buildUserInputCard(opts: UserInputCardOptions): CardObject {
           label: optionDisplay(option),
           value: String(optionIndex),
         })),
-      }));
+      }), width: 'fill' });
     }
 
     if (question.isOther || !hasOptions(question)) {
-      formElements.push(input({
+      fields.push(input({
         name: customField(index),
-        label: hasOptions(question) ? text.customOptional : text.customRequired,
-        placeholder: text.customPlaceholder,
-        inputType: 'multiline_text',
-        rows: 2,
+        placeholder: hasOptions(question) ? text.customOptional : text.customPlaceholder,
+        inputType: 'text',
         maxLength: MAX_CUSTOM_TEXT_LENGTH,
         width: 'fill',
         required: !hasOptions(question),
       }));
     }
+    formElements.push(fields.length > 1
+      ? columns(fields.map((field) => ({ elements: [field], width: 'weighted', weight: 1 })))
+      : fields[0]!);
     if (index < opts.questions.length - 1) formElements.push(hr());
   }
 
@@ -305,7 +295,7 @@ export function buildUserInputCard(opts: UserInputCardOptions): CardObject {
     header: { title: text.title, template: 'blue' },
     summary: text.title,
     forward: false,
-    widthMode: 'fill',
+    widthMode: 'default',
   });
 }
 
