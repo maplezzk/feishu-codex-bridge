@@ -507,12 +507,6 @@ export class AppServerClient {
           'thread-closed',
         );
         return;
-      case 'thread/goal/cleared':
-        this.resolveUserInputs(
-          (request) => request.threadId === notification.params.threadId,
-          'goal-cleared',
-        );
-        return;
       case 'error':
         if (!notification.params.willRetry) {
           this.resolveUserInputs(

@@ -42,6 +42,10 @@ process.stdin.on('data', (d) => {
       emitTurnStarted();
       if (mode === 'answer') emitInput(101);
       else if (mode === 'string-answer') emitInput('request-string');
+      else if (mode === 'goal-cleared') {
+        emitInput(108);
+        send({ method: 'thread/goal/cleared', params: { threadId: 'thread-1' } });
+      }
       else if (mode === 'resolved') {
         emitInput(102);
         setTimeout(() => emitResolved(102), 10);
@@ -63,7 +67,7 @@ process.stdin.on('data', (d) => {
       continue;
     }
     if (!msg.method && Object.prototype.hasOwnProperty.call(msg, 'id')) {
-      if (mode === 'answer' || mode === 'string-answer') {
+      if (mode === 'answer' || mode === 'string-answer' || mode === 'goal-cleared') {
         setTimeout(() => emitResolved(msg.id), 5);
       }
       continue;
@@ -110,6 +114,21 @@ afterAll(async () => {
 });
 
 describe('app-server request_user_input transport', () => {
+  it('clearing a goal preserves its current question until the server resolves it', async () => {
+    await withClient('goal-cleared', async (client, logFile) => {
+      const events = client.streamEvents()[Symbol.asyncIterator]();
+      await client.request('turn/start', {});
+      await events.next();
+      const input = await events.next();
+      if (input.value?.method !== 'bridge/userInput') throw new Error('expected user input');
+      const request = input.value.params;
+      expect((await events.next()).value?.method).toBe('thread/goal/cleared');
+      expect(request.isPending()).toBe(true);
+      await request.respond({ choice: { answers: ['A'] } });
+      await vi.waitFor(() => expect(readLog(logFile).some((line) => line.id === 108 && line.result?.answers?.choice?.answers?.[0] === 'A')).toBe(true));
+    });
+  });
+
   it('answers the original numeric request id once and exposes the resolved lifecycle', async () => {
     await withClient('answer', async (client, logFile) => {
       const events = client.streamEvents()[Symbol.asyncIterator]();
