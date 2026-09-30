@@ -12,7 +12,12 @@ const fake = vi.hoisted(() => ({
   final: vi.fn(async (..._args: unknown[]) => true),
   createCard: vi.fn(async (..._args: unknown[]) => 'card'),
   send: vi.fn(async () => ({})),
+  questionSend: vi.fn(async (..._args: any[]) => ({ messageId: 'question-card' })),
+  questionUpdate: vi.fn(async () => true),
   log: { info: vi.fn(), warn: vi.fn(), fail: vi.fn() },
+}));
+vi.mock('../src/card/managed', async original => ({
+  ...await original<object>(), sendManagedCard: fake.questionSend, updateManagedCard: fake.questionUpdate,
 }));
 vi.mock('../src/bot/steer-delivery', async original => { const real = await original<typeof import('../src/bot/steer-delivery')>(); return { ...real, steerWithDeadline: (thread: any, input: any, id: string) => real.steerWithDeadline(thread, input, id, undefined, 150) }; });
 vi.mock('../src/core/logger', () => ({ log: fake.log, withTrace: (_ctx: unknown, fn: () => unknown) => fn() }));
@@ -126,6 +131,62 @@ afterEach(async () => {
 const until = (check: () => void) => vi.waitFor(check, { interval: 5 });
 
 describe('message queue lifecycle', () => {
+  it('adopts a new goal topic before opening its first async question and steers the owner answer', async () => {
+    const run = thread();
+    Object.assign(run.t, { runGoal: () => run.t.runStreamed({ text: 'goal' }), clearGoal: vi.fn(async () => undefined) });
+    fake.backend.startThread.mockResolvedValue(run.t);
+    const o = setup();
+    await o.onMessage({ ...message('/goal 测试提问'), threadId: undefined });
+    await until(() => expect(run.consumed).toHaveLength(1));
+    run.emit({ type: 'user_input_async', threadId: 'host', turnId: 'turn-1', itemId: 'first-goal-question',
+      questions: [{ id: '0', header: 'Q1', question: '是否继续？', isOther: true, isSecret: false,
+        options: [{ label: '继续', description: '' }] }],
+    });
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'async-user-input-opened', expect.anything()));
+    expect(fake.createCard).toHaveBeenCalled();
+    const card = fake.questionSend.mock.calls.find((args) => JSON.stringify(args[2]).includes('codex_user_input'))![2];
+    function nodes(v: any): any[] { return !v || typeof v !== 'object' ? [] : [v, ...Object.values(v).flatMap(nodes)]; }
+    const all = nodes(card), callback = all.find((node) => node.a === 'codex.question.submit');
+    const select = all.find((node) => node.tag === 'select_static');
+    await o.dispatcher.handle({ chatId: 'chat', messageId: 'question-card', operator: { openId: 'owner' },
+      action: { value: callback, tag: 'button' }, raw: { action: { form_value: { [select.name]: '0' } } },
+    } as never);
+    expect(run.t.steer).toHaveBeenCalledWith({ text: expect.stringContaining('是否继续？\n回答：继续') }, 'turn-1');
+    run.emit({ type: 'goal_update', status: 'complete', objective: '测试提问', tokensUsed: 1, timeUsedSeconds: 1, tokenBudget: null });
+    run.turns[0]!.resolve();
+  });
+
+  it('keeps an async question after turn completion and delivers the owner answer once in the same session', async () => {
+    const run = thread();
+    fake.backend.resumeThread.mockResolvedValue(run.t);
+    const o = setup();
+    await o.onMessage(message('测试一下提问功能，随便提问我一下'));
+    await until(() => expect(run.consumed).toHaveLength(1));
+    run.emit({ type: 'user_input_async', threadId: 'host', turnId: 'turn-1', itemId: 'async-1',
+      questions: [{ id: '0', header: 'Q1', question: '希望用什么风格？', isOther: true, isSecret: false,
+        options: [{ label: '简洁', description: '' }, { label: '详细', description: '' }] }],
+    });
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'async-user-input-opened', expect.anything()));
+    const card = fake.questionSend.mock.calls.find((args) => JSON.stringify(args[2]).includes('codex_user_input'))![2];
+    function nodes(v: any): any[] { return !v || typeof v !== 'object' ? [] : [v, ...Object.values(v).flatMap(nodes)]; }
+    const all = nodes(card);
+    const callback = all.find((node) => node.a === 'codex.question.submit');
+    const select = all.find((node) => node.tag === 'select_static');
+    const action = (owner: string) => ({ chatId: 'chat', messageId: 'question-card', operator: { openId: owner },
+      action: { value: callback, tag: 'button' }, raw: { action: { form_value: { [select.name]: '1' } } },
+    });
+    run.turns[0]!.resolve();
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
+    await o.dispatcher.handle(action('intruder') as never);
+    expect(run.consumed).toHaveLength(1);
+    await o.dispatcher.handle(action('owner') as never);
+    await until(() => expect(run.consumed).toHaveLength(2));
+    expect(run.consumed[1]!.text).toContain('希望用什么风格？\n回答：详细');
+    await o.dispatcher.handle(action('owner') as never);
+    expect(run.consumed).toHaveLength(2);
+    run.turns[1]!.resolve();
+  });
+
   it('starts the follow-up when steer rejects after its original consumer has finished', async () => {
     const run = thread();
     fake.backend.resumeThread.mockResolvedValue(run.t);

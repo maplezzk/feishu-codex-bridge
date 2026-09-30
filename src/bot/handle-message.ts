@@ -19,6 +19,7 @@ import {
   DEFAULT_PERMISSION_MODE,
   REASONING_EFFORTS,
   type AgentBackend,
+  type AgentEvent,
   type AgentInput,
   type AgentRun,
   type AgentThread,
@@ -71,7 +72,7 @@ import {
   type SessionTitleBackendConfig,
 } from '../config/schema';
 import { CardDispatcher } from '../card/dispatcher';
-import { createUserInputService } from '../card/user-input';
+import { createAsyncUserInputRequest, createUserInputService } from '../card/user-input';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
 import { RunRender } from '../card/run-render';
 import { finalMessageText, initialState, reduce, type RunState } from '../card/run-state';
@@ -4142,6 +4143,52 @@ export function createOrchestrator(
     timing?: { tResolve: number; tWeave: number };
   }
 
+  async function openAsyncInput(
+    event: Extract<AgentEvent, { type: 'user_input_async' }>,
+    opts: LaunchOpts,
+    sessionKey: string | undefined,
+    replyTo: string,
+    requesterOpenId: string | undefined,
+  ): Promise<void> {
+    if (!sessionKey || !requesterOpenId) throw new Error('async user input has no bound session or requester');
+    const request = createAsyncUserInputRequest(event, async (text) => {
+      if (shuttingDown) throw new Error('bridge is shutting down');
+      const project = await getProjectByChatId(opts.chatId);
+      const rec = await getSession(sessionKey);
+      if (!rec || rec.sessionId !== event.threadId || rec.chatId !== opts.chatId) {
+        throw new Error('the question no longer belongs to the current session');
+      }
+      if (!isChatAllowed(cfg, opts.chatId) || !isUserAllowedInProject(cfg, project, requesterOpenId)) {
+        throw new Error('the question requester no longer has access');
+      }
+      const current = active.get(sessionKey);
+      if (current?.intakeCancelled) throw new Error('the conversation has been stopped');
+      if (current?.isGoal) {
+        // Goals already own the event stream and never consume ordinary queues.
+        const turnId = current.run?.turnId();
+        if (!turnId || !current.thread) throw new Error('goal has no active turn; retry your answer as a message');
+        await steerWithDeadline(current.thread, { text }, turnId);
+        return;
+      }
+      const synthetic: NormalizedMessage = {
+        messageId: replyTo, chatId: opts.chatId, chatType: 'group', senderId: requesterOpenId,
+        content: text, rawContentType: 'text', resources: [], mentions: [],
+        mentionAll: false, mentionedBot: true,
+        threadId: opts.flat ? undefined : sessionKey.replace(/#(admin|guest)$/, ''),
+        createTime: Date.now(),
+      };
+      // The same reservation/queue path as a real user message: no detached
+      // turn/start that would bypass concurrency, permissions or run cards.
+      startReservedRun(synthetic, text, sessionKey, Boolean(opts.flat), project,
+        turnPerm(project, requesterOpenId), undefined, { text }, '回答提问');
+      log.info('agent', 'async-user-input-submitted', { sessionId: event.threadId, itemId: event.itemId });
+    });
+    await userInputs.open(request, {
+      chatId: opts.chatId, replyToMessageId: replyTo, inThread: !opts.flat, requesterOpenId,
+    });
+    log.info('card', 'async-user-input-opened', { sessionId: event.threadId, itemId: event.itemId });
+  }
+
   /** The queue placeholder card's CardKit entity, handed to the run for in-place
    * reuse (占位卡→run 卡同一实体翻面，防闪烁). */
   interface QueuedCardHandle {
@@ -4631,6 +4678,10 @@ export function createOrchestrator(
         let evCount = 0;
         let textChars = 0;
         for await (const ev of cardEvents.consume(guarded)) {
+          if (ev.type === 'user_input_async') {
+            await openAsyncInput(ev, opts, topicThreadId, cardMsgId, state.requesterOpenId);
+            continue;
+          }
           if (ev.type === 'user_input_request') {
             void userInputs.open(ev.request, {
               chatId: opts.chatId,
@@ -4712,6 +4763,9 @@ export function createOrchestrator(
           procDead,
           protocolFault,
         });
+        if (render.terminal() !== 'done') {
+          await userInputs.closeThread(thread.sessionId, 'turn-failed');
+        }
         rc.rs = segmentSnapshot();
         if (interrupted) log.info('agent', 'interrupt', { graceful: !stopper.forced(), threadId: topicThreadId ?? null });
 
@@ -5020,6 +5074,7 @@ export function createOrchestrator(
       if (active.get(activeKey) === state) active.delete(activeKey);
       const dropped = state.queue.splice(0).length;
       disposeInterrupt?.();
+      await userInputs.closeThread(thread.sessionId, 'run-failed');
       state.run = undefined;
       state.interrupt = undefined;
       // A stream/card failure can leave an agent turn running. Retire that
@@ -5034,7 +5089,7 @@ export function createOrchestrator(
       // A replacement run may have reserved the key while failure feedback
       // was in flight. Never delete another run's reservation.
       if (active.get(activeKey) === state) active.delete(activeKey);
-      await userInputs.closeThread(thread.sessionId, 'run-ended');
+      await userInputs.closeThread(thread.sessionId, state.intakeCancelled ? 'interrupted' : 'run-ended');
       clearInterval(cardClock);
       state.steerReply = undefined;
       state.voiceReply = undefined;
@@ -5334,6 +5389,14 @@ export function createOrchestrator(
         idledOut = true;
       }, stop, run.lastActivity);
       for await (const ev of guarded) {
+        if (ev.type === 'user_input_async') {
+          // A question can be a new goal's first output. Create/adopt the topic
+          // before capturing the session key used by its later answer callback.
+          if (!cur) cur = startTurn();
+          await ensureCard(cur);
+          await openAsyncInput(ev, opts, topicThreadId, cur.cardMsgId ?? replyTo, state.requesterOpenId);
+          continue;
+        }
         if (ev.type === 'user_input_request') {
           void userInputs.open(ev.request, {
             chatId: opts.chatId,
@@ -5390,6 +5453,7 @@ export function createOrchestrator(
         }
         if (ev.type === 'error') {
           goalErrorMsg = ev.message;
+          if (!ev.willRetry) await userInputs.closeThread(opts.thread.sessionId, 'goal-failed');
           if (!cur) continue; // set-failure before any turn → terminal card only
         }
         if (!cur) cur = startTurn();
@@ -5450,7 +5514,7 @@ export function createOrchestrator(
         .catch(() => undefined);
     } finally {
       clearInterval(cur?.clock);
-      await userInputs.closeThread(opts.thread.sessionId, 'run-ended');
+      await userInputs.closeThread(opts.thread.sessionId, interrupted || idledOut ? 'interrupted' : 'run-ended');
       active.delete(activeKey);
       if (cur?.cardMsgId) runsByCard.delete(cur.cardMsgId);
       // Recycle the codex process (it may still be mid-goal, and a terminated goal
@@ -5558,6 +5622,11 @@ export function createOrchestrator(
             for await (const ev of guarded) {
               if (ev.type === 'user_input_request') {
                 await ev.request.reject('Interactive questions are unavailable in document comments. Ask in the comment text instead.');
+                log.info('agent', 'user-input-unavailable', { scope: 'document-comment' });
+                continue;
+              }
+              if (ev.type === 'user_input_async') {
+                state = reduce(state, { type: 'error', message: '文档评论不支持提问卡，请在评论文字中作答。', willRetry: false });
                 log.info('agent', 'user-input-unavailable', { scope: 'document-comment' });
                 continue;
               }
@@ -6030,6 +6099,7 @@ export function createOrchestrator(
     // close() SIGKILLs each app-server child; settle all so one hang/throw
     // doesn't block reaping the rest.
     await Promise.allSettled(live.map((t) => t.close()));
+    await userInputs.closeAll('shutdown');
     await Promise.allSettled([...runTasks]);
     log.info('bridge', 'shutdown', { closed: live.length });
   }

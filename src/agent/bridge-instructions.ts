@@ -38,3 +38,12 @@ export const BRIDGE_DEVELOPER_INSTRUCTIONS = [
   '必要时再直接中断并清理对应子任务。遇到网络、连接或超时错误时，只有在调用结果确定未落地且操作可安全重试时才重试一次；',
   '写入类调用结果不确定时先查询状态，绝不要盲目重复提交。',
 ].join('\n');
+
+export const CODEX_BRIDGE_DEVELOPER_INSTRUCTIONS = [
+  BRIDGE_DEVELOPER_INSTRUCTIONS,
+  '',
+  '4) 提问：需要等待用户回答才能继续时（包括自主目标任务），调用 request_user_input；',
+  '可以异步作答的问题可调用 request_user_input_async。一次最多提 1–3 个问题，飞书桥会生成提问卡。',
+  '用户的回答会通过工具结果或后续用户输入送回；不要仅在回复里声称“已发起提问”而没有调用提问工具。',
+  '敏感问题必须使用支持 isSecret 的 request_user_input 并标记 isSecret=true，不要通过异步提问收集敏感信息。',
+].join('\n');

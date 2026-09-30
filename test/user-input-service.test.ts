@@ -4,6 +4,7 @@ import { CardDispatcher } from '../src/card/dispatcher';
 import {
   buildUserInputCard,
   createUserInputService,
+  createAsyncUserInputRequest,
   customField,
   questionField,
   USER_INPUT_ACTION,
@@ -340,5 +341,21 @@ describe('Codex user-input service', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(t.harness.reject).toHaveBeenCalledWith('run-ended');
     expect(JSON.stringify(t.updates.at(-1)?.card)).toContain('提问已关闭');
+  });
+
+  it('keeps async cards after turn completion but closes them on shutdown without submitting an answer', async () => {
+    const t = setup();
+    const submit = vi.fn(async () => undefined);
+    const request = createAsyncUserInputRequest({ threadId: 'thread-1', turnId: 'turn-1', itemId: 'async-1',
+      questions: [question()],
+    }, submit);
+    await t.service.open(request, t.scope);
+    await t.service.closeThread('thread-1', 'run-ended');
+    expect(request.isPending()).toBe(true);
+    await t.service.closeAll('shutdown');
+    expect(request.isPending()).toBe(false);
+    await click(t, { [questionField(0)]: '0' });
+    expect(submit).not.toHaveBeenCalled();
+    expect(t.notices.at(-1)?.text).toMatch(/失效/);
   });
 });
