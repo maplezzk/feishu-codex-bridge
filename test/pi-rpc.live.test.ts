@@ -90,7 +90,7 @@ describe.runIf(LIVE)('pi RPC backend live E2E', () => {
     try {
       await expect(backend.startThread({ cwd, mode: 'qa' })).rejects.toThrow(/full/);
       await expect(backend.startThread({ cwd, mode: 'write' })).rejects.toThrow(/full/);
-      expect(backend.capabilities?.goal).toBe(false);
+      expect(backend.capabilities?.goal).toBe(true);
       const models = await backend.listModels();
       const selected = models.find((model) => model.isDefault);
       expect(models.length).toBeGreaterThan(0);
@@ -118,7 +118,7 @@ describe.runIf(LIVE)('pi RPC backend live E2E', () => {
       const compact = await thread.compact();
       expect(typeof compact.compacted).toBe('boolean');
       expect(thread.isAlive()).toBe(true);
-      save('controls-scenario-result.json', { status: 'passed', permissionsRejected: ['qa', 'write'], goal: false, aborted, nextTurn: next.text, compact, modelCount: models.length, selectedModel: selected, processAlive: thread.isAlive() });
+      save('controls-scenario-result.json', { status: 'passed', permissionsRejected: ['qa', 'write'], goal: true, aborted, nextTurn: next.text, compact, modelCount: models.length, selectedModel: selected, processAlive: thread.isAlive() });
     } finally {
       await thread?.close();
       execFileSync('trash', [cwd]);

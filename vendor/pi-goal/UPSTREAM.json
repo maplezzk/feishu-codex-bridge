@@ -1,0 +1,56 @@
+{
+  "name": "@narumitw/pi-goal",
+  "version": "0.54.8",
+  "published": "2026-09-20T08:08:03.909Z",
+  "license": "MIT",
+  "repository": {
+    "url": "git+https://github.com/narumiruna/pi-extensions.git",
+    "type": "git",
+    "directory": "packages/pi-goal"
+  },
+  "peerDependencies": {
+    "typebox": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@narumitw/pi-tui-kit": "^0.59.0"
+  },
+  "integrity": "sha512-ba165WkOdBEQNYgjTa2MHgRtOh/hTLveObPzdoE29FOrfktymcBlayEHoXd9Jjw44VQ8bX7cq6V57zp0rJLVgQ==",
+  "copiedFilesArePrePatchHashes": true,
+  "bridgePatch": {
+    "purpose": "Expose the upstream runtime to the bridge while isolating it from a user's independently installed pi-goal extension.",
+    "changes": [
+      "registerGoalRuntime and the default goal factory return runtime, commands, and runController.",
+      "Legacy global pi-goal-state.json cleanup is disabled; native bridge session entries remain authoritative.",
+      "Commands, tools, native session entry types, contract and continuation markers, and run event channels use the bridge namespace; workflow:mutex:v1 remains shared for concurrency protection.",
+      "Managed state events carry persisted full Goal snapshots and forward same-status usage/waiting changes; terminal usage survives upstream active state clearing."
+    ],
+    "namespace": {
+      "command": "bridge-upstream-goal",
+      "controlCommand": "bridge-goal",
+      "tools": [
+        "bridge_goal_complete",
+        "bridge_goal_blocked",
+        "bridge_goal_wait"
+      ],
+      "sessionEntry": "bridge-goal-state",
+      "runChannels": "bridge-pi-goal:*",
+      "contract": "bridge-goal-contract",
+      "markers": "bridge-pi-goal-*"
+    }
+  },
+  "copiedFiles": {
+    "index.ts": "aa1488c18e842941f01ce6cac88bed91f17bfa5ba00e8631aae2988c4b2709e6",
+    "index.ts.map": "af4ee9691d8ce3a5372e7a67d5d0ba3bcba035f4abfd8edbbee1d060cca2e36d",
+    "chunks/chunk-RNWM7MOG.ts.map": "fccf01f189c073ebaee395e438a3dbe8fb5a2db4600c6ec3f58755aa910a6d8e",
+    "chunks/settings-ui-T77VFPTK.ts": "b7038dc2edda607c1714952e85c2fd3e0013a396a638db1ce8abec3c97e22093",
+    "chunks/settings-ui-T77VFPTK.ts.map": "b2eea29d486f69ba0df1c6f880cda2414c1fd418008e657b43d73bdab0470792",
+    "chunks/menu-7W5HGHFO.ts": "ae7ab867dbe88ec34e983cc4cff7600f91d390414a27bc763b7f5b9130a7e828",
+    "chunks/chunk-RNWM7MOG.ts": "106b0beb8ee64ab177cc1a9392afff0288491acec7ea00176cc864f22a80eb03",
+    "chunks/chunk-7FMBWODN.ts": "018283860565509ef92e4e7bde7e9b564f90dd2b242577a274bbcdc5eea8f492",
+    "chunks/chunk-7FMBWODN.ts.map": "0c70bdb33116b476a83b4a5fd9d15a63ea13d0524532d5246821fbd955370877",
+    "chunks/menu-7W5HGHFO.ts.map": "44b44a5c8491fa9e2602c7611e8acd51c4bbb48b4ad704248806329e94bb99e2"
+  }
+}

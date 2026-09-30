@@ -133,7 +133,7 @@ export const BACKEND_CATALOG: readonly BackendCatalogEntry[] = [
     },
     // pi 没有内置项目沙箱，第一版只允许完全访问，拒绝静默提升 qa/write。
     supportedModes: ['full'],
-    blurb: 'Pi Coding Agent（RPC；仅完全访问；不支持 goal）',
+    blurb: 'Pi Coding Agent（RPC；goal / steer / compact / resume；仅完全访问）',
   },
 ];
 

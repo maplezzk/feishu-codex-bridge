@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { mkdir, stat, writeFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import { log } from '../../core/logger';
 import type {
   AgentBackend,
@@ -20,6 +22,8 @@ import { findPiSession, listPiSessions, readPiHistory } from './history';
 import { piVersionAsync, probePi, resolvePiBin, type PiProbe } from './locate';
 import { assertPiPermission } from './permission';
 import { PiThread } from './thread';
+import { piGoalExtensionPath } from './goal-assets';
+import { sendPiGoalCommand } from './goal-protocol';
 
 const PI_PACKAGE = '@earendil-works/pi-coding-agent';
 const PI_EFFORTS: readonly ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
@@ -32,6 +36,35 @@ export interface PiBackendDeps {
   listSessions: typeof listPiSessions;
   findSession: typeof findPiSession;
   readHistory: typeof readPiHistory;
+}
+
+/** Materialize Pi's own header/entries before the first Goal can be cancelled.
+ * Pi keeps setup-only sessions in memory. Reopening the exact file through Pi
+ * marks it flushed, so later native appends do not try to recreate it. */
+async function prepareGoalSession(client: PiRpcClientLike, state: PiRecord, cwd: string): Promise<void> {
+  const status = await sendPiGoalCommand(client, { action: 'status', requestId: randomUUID() });
+  const header = status.sessionHeader as PiRecord | undefined;
+  const path = state.sessionFile;
+  if (!header || typeof header !== 'object' || header.type !== 'session'
+    || header.id !== state.sessionId || typeof header.cwd !== 'string' || resolve(header.cwd) !== resolve(cwd)
+    || typeof path !== 'string' || !path) {
+    throw new Error('pi Goal 扩展没有返回当前原生会话头，已拒绝开始会话');
+  }
+  try {
+    const file = await stat(path);
+    if (!file.isFile() || file.size === 0) throw new Error('pi 原生会话文件无效');
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const data = await client.request<PiRecord>('get_entries');
+  if (!Array.isArray(data.entries)) throw new Error('pi 未返回原生会话 entries，无法保存初始 Goal 会话');
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${[header, ...data.entries].map((entry) => JSON.stringify(entry)).join('\n')}\n`, { flag: 'wx', mode: 0o600 });
+  const switched = await client.request<PiRecord>('switch_session', { sessionPath: path });
+  if (switched.cancelled) throw new Error('pi 取消了原生会话初始化');
+  const reopened = normalizeState(await client.request<PiRecord>('get_state'));
+  ensureSessionId(reopened, String(state.sessionId), '初始化');
 }
 
 const DEFAULT_DEPS: PiBackendDeps = {
@@ -48,7 +81,7 @@ export class PiRpcBackend implements AgentBackend {
   readonly id = 'pi-rpc';
   readonly displayName = 'pi';
   readonly capabilities: AgentCapabilities = {
-    goal: false,
+    goal: true,
     steer: true,
     compact: true,
     resume: true,
@@ -187,10 +220,11 @@ export class PiRpcBackend implements AgentBackend {
       '--session-id', sessionId,
       ...modelArgs(opts.model),
       ...(opts.effort ? ['--thinking', toPiLevel(opts.effort)] : []),
-    ]);
+    ], true);
     try {
       const state = normalizeState(await client.request<PiRecord>('get_state'));
       ensureSessionId(state, sessionId, '新建');
+      await prepareGoalSession(client, state, opts.cwd);
       await configureSession(client, state, opts);
       const applied = normalizeState(await client.request<PiRecord>('get_state'));
       verifyAppliedOptions(applied, opts);
@@ -211,10 +245,11 @@ export class PiRpcBackend implements AgentBackend {
     assertPiPermission(opts.mode);
     if (!isPiSessionId(opts.sessionId)) throw new Error(`无效的 pi 会话 ID：${opts.sessionId}`);
     const sessionPath = await this.findExistingSession(opts.cwd, opts.sessionId);
-    const client = await this.openClient(opts.cwd, ['--session', sessionPath]);
+    const client = await this.openClient(opts.cwd, ['--session', sessionPath], true);
     try {
       const state = normalizeState(await client.request<PiRecord>('get_state'));
       ensureSessionId(state, opts.sessionId, '恢复');
+      await prepareGoalSession(client, state, opts.cwd);
       await configureSession(client, state, opts);
       const applied = normalizeState(await client.request<PiRecord>('get_state'));
       verifyAppliedOptions(applied, opts);
@@ -231,10 +266,10 @@ export class PiRpcBackend implements AgentBackend {
     }
   }
 
-  private async openClient(cwd: string, args: readonly string[]): Promise<PiRpcClientLike> {
+  private async openClient(cwd: string, args: readonly string[], goal = false): Promise<PiRpcClientLike> {
     const bin = this.deps.resolveBin();
     if (!bin) throw new Error('未找到 pi CLI（设置 PI_BIN 或安装 pi 后再选择 pi 后端）');
-    const client = this.deps.createClient({ bin, cwd, args });
+    const client = this.deps.createClient({ bin, cwd, args: goal ? [...args, '--extension', piGoalExtensionPath()] : args });
     if (!client.isAlive()) {
       await closeWithLog(client, 'openClient/close-dead');
       throw new Error('pi RPC 进程启动后立即退出');

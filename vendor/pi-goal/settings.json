@@ -1,0 +1,9 @@
+{
+  "rpc": {
+    "enabled": true
+  },
+  "continuationLimits": {
+    "automaticTurns": 25,
+    "noProgressTurns": 3
+  }
+}
