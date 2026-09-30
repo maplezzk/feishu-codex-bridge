@@ -19,6 +19,7 @@ const send = (msg) => process.stdout.write(JSON.stringify({jsonrpc:'2.0', ...msg
 const event = (method, extra={}) => send({method,params:{threadId:'host',
  ...(method.startsWith('turn/')?{}:{turnId:'turn'}),...extra}});
 let clock;
+let startClock;
 let scopeCount=0;
 const finish = () => {
  clearInterval(clock);
@@ -42,6 +43,16 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   send({id:msg.id,result:{}});return;
  }
  if(msg.method==='turn/interrupt') { send({id:msg.id,result:{}}); finish(); return; }
+ if(msg.method==='turn/steer') {
+  send({id:msg.id,result:{}});
+  if(msg.params.input[0].text==='ready') startClock();
+  else {
+   event('item/completed',{item:{type:'contextCompaction',id:'compact'}});
+   event('item/agentMessage/delta',{itemId:'answer',delta:'Recovered'});
+   finish();
+  }
+  return;
+ }
  if(msg.method!=='turn/start') {
   send({id:msg.id,result:msg.method==='thread/start'?{thread:{id:'host'}}:{}}); return;
  }
@@ -53,7 +64,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  send({id:msg.id,result:{turn:{id:'turn'}}});
  event('turn/started',{turn:{id:'turn'}});
  let ticks=0;
- clock=setInterval(()=>{
+ startClock=()=> { clock=setInterval(()=>{
   ticks++;
   if(mode==='noise') {
    process.stderr.write('DEBUG unrelated: response.compaction.compacting\\n');
@@ -74,23 +85,17 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
    event('turn/started',{turn:{id:'stale-turn'}});
    heartbeat('host','turn');
    event('turn/completed',{turn:{id:'stale-turn'}});
-   if(ticks===8) {
-    event('item/agentMessage/delta',{itemId:'answer',delta:'Recovered'});
-    finish();
-   }
+   if(ticks===8) clearInterval(clock);
    return;
   }
   // A real stderr line can be split at any byte boundary.
   process.stderr.write('DEBUG codex_api::sse::responses: unhandled responses event: "response.compaction.');
   setTimeout(()=>process.stderr.write('compacting"\\n'),5);
   if(mode==='heartbeat' && ticks===8) {
-   setTimeout(()=>{
-    event('item/completed',{item:{type:'contextCompaction',id:'compact'}});
-    event('item/agentMessage/delta',{itemId:'answer',delta:'Recovered'});
-    finish();
-   },10);
+   clearInterval(clock);
   }
- },50);
+ },50); };
+ if(!['json','text-spans','heartbeat'].includes(mode)) startClock();
 });
 `;
 const dir = mkdtempSync(join(tmpdir(), 'bridge-compaction-'));
@@ -116,7 +121,15 @@ describe('compaction progress through the real app-server transport', () => {
     await withThread(async thread => {
       const run = thread.runStreamed({ text: mode });
       const events: AgentEvent[] = [];
-      for await (const event of run.events) events.push(event);
+      for await (const event of run.events) {
+        events.push(event);
+        if (event.type === 'turn_started') await thread.steer({ text: 'ready' }, event.turnId);
+        // stdout and stderr are separate pipes. Acknowledge receipt before
+        // the fixture completes the turn rather than assuming delivery order.
+        if (events.filter(e => e.type === 'context_compacting').length === 8 && event.type === 'context_compacting') {
+          await thread.steer({ text: 'finish' }, run.turnId()!);
+        }
+      }
       expect(events.filter(e => e.type === 'context_compacting')).toHaveLength(8);
       expect(events.filter(e => e.type === 'turn_started')).toEqual([{ type: 'turn_started', turnId: 'turn' }]);
       expect(events.at(-1)).toEqual({ type: 'done', turnId: 'turn' });
@@ -163,9 +176,13 @@ describe('compaction progress through the real app-server transport', () => {
       for await (const event of withIdleTimeout(run.events, 150, timeout, undefined, run.lastActivity)) {
         events.push(event);
         state = reduce(state, event);
+        if (event.type === 'turn_started') await thread.steer({ text: 'ready' }, event.turnId);
         if (event.type === 'context_compacting') {
           expect(JSON.stringify(buildRunCard({ rs: state }))).toContain('正在压缩上下文');
           expect(state.terminal).toBe('running');
+          if (events.filter(e => e.type === 'context_compacting').length === 8) {
+            await thread.steer({ text: 'finish' }, run.turnId()!);
+          }
         }
       }
       expect(timeout).not.toHaveBeenCalled();
