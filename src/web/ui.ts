@@ -1,3 +1,4 @@
+import { VOICE_TITLE, VOICE_DESCRIPTION, VOICE_NOTICE, VOICE_DOC_URL } from '../voice/view';
 /**
  * Web 控制台前端 —— 单文件内嵌 HTML（零依赖、零构建）。
  *
@@ -28,6 +29,21 @@
  * 约束：纯字符串拼接、不用反引号 / ${}（这段会被原样塞进 <script>）。
  */
 export const UI_PURE_JS = `
+  function eventDiagnosisView(d) {
+    if (!d) return { icon: '⚠️', title: '事件订阅未检测', detail: '未获取到事件订阅诊断结果，请重试。', showConfig: true };
+    var version = d.version || '?';
+    switch (d.state) {
+      case 'ok':
+        return { icon: '✅', title: '必需事件已订阅', detail: '已发布版本 v' + version + ' 已订阅 im.message.receive_v1。', showConfig: !!(d.missingOptional && d.missingOptional.length) };
+      case 'missing':
+        return { icon: '❌', title: '缺少必需事件', detail: '已发布版本 v' + version + ' 缺少：' + (d.missingRequired || []).join('、') + '。添加后发布新版本。', showConfig: true };
+      case 'unpublished':
+        return { icon: '⚠️', title: '未找到已发布版本', detail: '在事件配置中添加 im.message.receive_v1，然后到「版本管理与发布」发布版本。', showConfig: true };
+      default:
+        return { icon: '⚠️', title: '事件订阅未能检测', detail: d.reason || '未获取到可用的订阅信息，请重试。', showConfig: true };
+    }
+  }
+
   // ── hash 路由：''/#overview → 仪表盘；#bot/<appId> → 某机器人；#backends/#doctor/#logs
   //    → 系统分页（后端管理 / 宿主机体检 / 实时日志）。侧栏导航与这些一一对应。──────────
   function parseRoute(hash) {
@@ -648,6 +664,33 @@ export const UI_HTML = `<!doctype html>
   }
   #confirmMask { z-index: 40; }
   #wizMask.open, #confirmMask.open { display: block; }
+  .voice-card h2 { margin-bottom: 6px; }
+  .voice-description { color: var(--text-2); font-size: 13px; line-height: 1.7; }
+  .voice-notice { margin-top: 6px; color: var(--text-3); font-size: 12px; line-height: 1.8; }
+  .voice-notice a { display: inline-block; margin-left: 4px; white-space: nowrap; text-underline-offset: 3px; }
+  .voice-controls { display: flex; align-items: center; margin-top: 18px; padding: 14px 0; border-top: 1px solid var(--border); }
+  .voice-switch { position: relative; min-height: 28px; border: 0; border-radius: 5px; background: transparent; color: var(--text); cursor: pointer; padding: 3px 4px 3px 48px; font: inherit; font-size: 13px; }
+  .voice-switch::before { content: ''; position: absolute; left: 0; top: 50%; margin-top: -10px; width: 36px; height: 20px; border-radius: 12px; background: var(--text-3); transition: background .15s; }
+  .voice-switch::after { content: ''; position: absolute; left: 3px; top: 50%; margin-top: -7px; width: 14px; height: 14px; border-radius: 50%; background: white; transition: transform .15s; }
+  .voice-switch[aria-checked="true"]::before { background: var(--accent); }
+  .voice-switch[aria-checked="true"]::after { transform: translateX(16px); }
+  .voice-switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+  .voice-switch:disabled { opacity: .5; cursor: default; }
+  .voice-status { padding: 13px 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); color: var(--text-2); font-size: 12.5px; line-height: 1.7; overflow-wrap: anywhere; }
+  .voice-status-line { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .voice-code { color: var(--text-3); font: 11px var(--mono); }
+  .voice-permission { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; }
+  .voice-permission-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .voice-hint { color: var(--text-3); font-size: 12px; line-height: 1.6; }
+  .voice-permission .btn, .voice-footer .btn { min-width: 84px; min-height: 32px; justify-content: center; flex-shrink: 0; text-decoration: none; }
+  .voice-footer { display: flex; justify-content: flex-end; margin-top: 14px; padding-right: 15px; }
+  .voice-card .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .voice-stopped { margin-top: 10px; }
+  @media (max-width: 480px) {
+    .voice-card { padding: 18px; }
+    .voice-permission { align-items: flex-start; flex-direction: column; gap: 10px; }
+    .voice-permission-actions { align-self: flex-end; }
+  }
   .switch { cursor: pointer; user-select: none; }
   .bot-row { display: flex; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
   .bot-row:last-child { border-bottom: 0; }
@@ -907,12 +950,23 @@ ${UI_PURE_JS}
       ? '所有人：' + tierLabel(p.mode)
       : '管理员：' + tierLabel(p.mode) + ' · 其他人：' + tierLabel(p.guestMode);
   }
-  function eventDiagText(d) {
-    if (!d) return '（未检测）';
-    if (d.state === 'ok') return '✅ 已生效（版本 v' + (d.version || '?') + ' 已订阅 im.message.receive_v1）';
-    if (d.state === 'missing') return '❌ 已发布版本 v' + (d.version || '?') + ' 缺事件：' + (d.missingRequired || []).join('、') + ' —— @机器人不会有反应';
-    if (d.state === 'unpublished') return '❌ 从未发布过版本 —— 事件订阅尚未生效，@机器人不会有反应';
-    return '⚠️ 未能自动检测（' + (d.reason || '未知原因') + '）';
+  function appendEventDiagnosis(parent, d, configUrl) {
+    var view = eventDiagnosisView(d);
+    var item = checkItem(view.icon, view.title, view.detail);
+    var body = item.lastChild;
+    if (d && d.missingOptional && d.missingOptional.length) {
+      body.appendChild(el('div', 'note', '可选事件未订阅：' + d.missingOptional.join('、') + '。不影响基本消息功能，需要时添加并发布版本。'));
+    }
+    if (view.showConfig && configUrl) {
+      var link = el('a', null, '打开「事件与回调」配置页 ↗');
+      link.href = configUrl; link.target = '_blank'; link.rel = 'noopener';
+      body.appendChild(link);
+    }
+    var help = el('details', 'note');
+    help.appendChild(el('summary', null, '消息或卡片按钮无响应时'));
+    help.appendChild(el('div', null, '若消息未送达，检查事件订阅方式是否为长连接；若按钮无响应，检查「回调配置」中的 card.action.trigger。'));
+    body.appendChild(help);
+    parent.appendChild(item);
   }
   function connText(s) {
     if (s === 'connected') return '✅ 已连接';
@@ -2086,6 +2140,7 @@ ${UI_PURE_JS}
     renderProjects(projList, pcount, b);
 
     // 🔔 普通任务结束提醒（每 bot 独立）。选择即保存；仅 long 额外展示分钟阈值。
+    renderVoiceCard(right, b);
     renderCompletionReminderCard(right, b);
 
     cols.appendChild(left);
@@ -2106,6 +2161,69 @@ ${UI_PURE_JS}
     var a = el('a', 'btn', label || '🔗 在飞书中打开');
     a.href = botOpenLink(appId, tenant); a.target = '_blank'; a.rel = 'noopener';
     return a;
+  }
+
+  var voiceBusy = {};
+  function renderVoiceCard(root, b) {
+    var box = el('div', 'card voice-card');
+    var heading = el('h2', null, ${JSON.stringify(VOICE_TITLE)}); box.appendChild(heading);
+    box.appendChild(el('div', 'voice-description', ${JSON.stringify(VOICE_DESCRIPTION)}));
+    var notice = el('div', 'voice-notice', ${JSON.stringify(VOICE_NOTICE)} + ' ');
+    var doc = el('a', null, '飞书 ASR 文档'); doc.href = ${JSON.stringify(VOICE_DOC_URL)};
+    doc.target = '_blank'; doc.rel = 'noopener noreferrer'; notice.appendChild(doc);
+    box.appendChild(notice);
+    var controls = el('div', 'voice-controls'); box.appendChild(controls);
+    var status = el('div', 'voice-status', '正在读取状态…');
+    status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite'); box.appendChild(status);
+    if (!b.running) box.appendChild(el('div', 'voice-hint voice-stopped', '请先启动此机器人。'));
+    root.appendChild(box);
+    fetch('/api/bots/' + encodeURIComponent(b.appId) + '/voice').then(function (r) {
+      if (!r.ok) throw new Error('读取失败'); return r.json();
+    }).then(function (v) {
+      if (!box.isConnected) return;
+      var h = v.feishu;
+      var testing = h.state === 'testing';
+      var cooling = h.retryAt && h.retryAt > Date.now();
+      var toggle = el('button', 'voice-switch', v.enabled ? '已开启' : '已关闭');
+      toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-label', ${JSON.stringify(VOICE_TITLE)});
+      toggle.setAttribute('aria-checked', String(v.enabled));
+      toggle.disabled = !b.running || !!voiceBusy[b.appId] || (!v.enabled && testing);
+      toggle.onclick = function () { voiceWrite(b.appId, { action: v.enabled ? 'disable' : 'enable' }); };
+      controls.appendChild(toggle);
+      var test = el('button', 'btn sm', testing ? '检测中…' : '测试');
+      test.disabled = !v.enabled || !b.running || !!voiceBusy[b.appId] || testing || !!cooling;
+      test.onclick = function () { voiceWrite(b.appId, { action: 'test' }); };
+      status.textContent = '';
+      status.style.display = v.enabled ? '' : 'none';
+      var statusLine = el('div', 'voice-status-line');
+      statusLine.appendChild(el('span', null, h.state === 'missing_permission' ? '缺少语音识别权限' : v.result));
+      if (h.code) statusLine.appendChild(el('span', 'voice-code', h.code));
+      status.appendChild(statusLine);
+      if (cooling) status.appendChild(el('div', 'voice-hint', '可重试时间：' + new Date(h.retryAt).toLocaleTimeString()));
+      if (v.enabled && h.state === 'missing_permission') {
+        var permission = el('div', 'voice-permission');
+        permission.appendChild(el('div', 'voice-hint', '授权并发布应用后，点击重新检测。'));
+        var permissionActions = el('div', 'voice-permission-actions');
+        var grant = el('a', 'btn sm primary', '去授权'); grant.href = v.grantUrl;
+        grant.target = '_blank'; grant.rel = 'noopener noreferrer'; permissionActions.appendChild(grant);
+        var recheck = el('button', 'btn sm', '重新检测');
+        recheck.disabled = !b.running || !!voiceBusy[b.appId];
+        recheck.onclick = function () { voiceWrite(b.appId, { action: 'refreshPermission' }); };
+        permissionActions.appendChild(recheck); permission.appendChild(permissionActions); status.appendChild(permission);
+      }
+      if (v.enabled) {
+        var testingControls = el('div', 'voice-footer'); testingControls.appendChild(test); box.appendChild(testingControls);
+      }
+    }).catch(function () { status.textContent = '无法读取状态，请刷新重试。'; });
+  }
+  function voiceWrite(botId, body) {
+    voiceBusy[botId] = true;
+    renderRoute();
+    fetch('/api/bots/' + encodeURIComponent(botId) + '/voice', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    }).then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.message || '设置失败'); return j; }); })
+      .catch(function (err) { toast(err.message || '请求失败'); })
+      .finally(function () { delete voiceBusy[botId]; loadState(); });
   }
 
   function renderBotOverview(card, b) {
@@ -2147,7 +2265,7 @@ ${UI_PURE_JS}
     box.textContent = '';
     box.className = 'note';
     if (!diag) return;
-    box.appendChild(el('div', null, 'ℹ️ 事件订阅：请自行到「事件与回调」确认已订阅 im.message.receive_v1（长连接）；此项系统无法可靠检测，仅作提醒。'));
+    appendEventDiagnosis(box, diag.event, diag.eventConfigUrl);
     var title = el('div', null, '🧠 后端环境：');
     title.style.marginTop = '6px';
     box.appendChild(title);
@@ -2594,7 +2712,7 @@ ${UI_PURE_JS}
     var w = $('wizBody');
     w.textContent = '';
     w.appendChild(el('h3', null, '② 接入检测'));
-    w.appendChild(el('div', 'note', '机器人「' + (wizBotId || '') + '」已注册。下面逐项检测接入状态，事件订阅生效后即可去群里 @它。'));
+    w.appendChild(el('div', 'note', '机器人「' + (wizBotId || '') + '」已注册。下面逐项查询凭据、权限和已发布版本的事件订阅。'));
     w.appendChild(wizStepBar(2));
     var s = wizSetup;
     if (!s || !s.credentials) {
@@ -2623,14 +2741,7 @@ ${UI_PURE_JS}
     }
     // 「加入活跃集 + 拉起上线」全程静默：新 bot 已在 pollWizSetup 自动加入活跃集，真正拉起
     // 靠最后一步「完成」弹窗确认重启——这里不再显示「待拉起上线」之类的中间态项。
-    // 事件订阅：系统无法可靠检测（长连接订阅在已发布版本里的体现不稳定），故只做提醒、不下结论、
-    // 不阻塞「下一步」。用户自行去后台核对。
-    var evHint = el('div');
-    var ea = el('a', null, '打开「事件与回调」配置页 ↗');
-    ea.href = (s.eventConfigUrl || '#'); ea.target = '_blank'; ea.rel = 'noopener';
-    evHint.appendChild(ea);
-    w.appendChild(checkItem('ℹ️', '事件订阅（请自行确认）',
-      '请到「事件与回调」确认已订阅 im.message.receive_v1（长连接模式）并已发布版本，否则 @机器人不会有反应。此项系统无法可靠检测，仅作提醒。', evHint));
+    appendEventDiagnosis(w, s.event, s.eventConfigUrl);
     w.appendChild(wizChecklistActions());
   }
 

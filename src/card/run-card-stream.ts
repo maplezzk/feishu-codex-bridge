@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
-import type { CardObject } from './cards';
+import type { CardObject, CardElement } from './cards';
 import { isCardIdNotReady } from './managed';
+import type { StreamingImages } from './outbound-images';
+import { serializeRuntimeCard } from './runtime-card-icons';
 
 /**
  * Min gap between throttled stream pushes. Finer = smoother chunked growth
@@ -173,6 +175,10 @@ function retryDelayMs(attempt: number, rateLimited: boolean): number {
  * streams and carries clickable controls (⏹).
  */
 export class RunCardStream {
+  /** Optional per-turn background image uploader (see {@link setImageWorker}).
+   * Deliberately not part of the push path: event consumption asks it to scan,
+   * never waits on it. */
+  private imageWorker: { uploads: StreamingImages; text: () => string } | null = null;
   private cardId = '';
   private _messageId = '';
   private seq = 0;
@@ -273,6 +279,32 @@ export class RunCardStream {
   }
 
   /**
+   * Attach the turn's background image uploader. `text` returns the answer as it
+   * stands (see {@link ../card/run-card}.runningAnswerText) — it's scanned for
+   * new `![](…)` refs on every frame, and a resolved `image_key` repaints the
+   * live card, which is how an image appears mid-turn instead of only at the end.
+   */
+  setImageWorker(uploads: StreamingImages, text: () => string): void {
+    this.imageWorker = { uploads, text };
+  }
+
+  /**
+   * Resolve this turn's images for the terminal frame. Bounded by
+   * {@link StreamingImages.finalize}'s own deadline, because the terminal frame
+   * is sequenced behind it — an upload that never settles must not leave the card
+   * on 「正在输出」forever.
+   *
+   * Returns an empty map when no uploader was attached ({@link setImageWorker}).
+   * Production always attaches one right after creating the stream (see
+   * {@link ./run-card}.attachRunImages), so that only covers a stream driven
+   * directly (a test, or a caller that only ever renders text).
+   */
+  async settleImages(finalAnswer: string): Promise<ReadonlyMap<string, string>> {
+    if (!this.imageWorker) return new Map();
+    return this.imageWorker.uploads.finalize(finalAnswer);
+  }
+
+  /**
    * Record the latest card and ensure the pump is running. Returns immediately;
    * calls that arrive while a push is in flight collapse into a single push of
    * the most recent card once that round-trip completes. Use this from the
@@ -280,6 +312,9 @@ export class RunCardStream {
    */
   streamCoalesced(channel: LarkChannel, fullCard: CardObject, answerEid: string | null): void {
     if (this.retryStopped) return;
+    // Kick the image uploader off the same snapshot the frame was built from, so
+    // a ref starts uploading the moment the model finishes writing it.
+    this.imageWorker?.uploads.refresh(this.imageWorker.text());
     this.pending = { card: fullCard, answerEid };
     this.pumpChannel = channel;
     if (!this.pumpPromise) this.pumpPromise = this.pump();
@@ -345,11 +380,12 @@ export class RunCardStream {
     if (!this.cardId || this.transportBroken) return false;
     const push = (): Promise<unknown> =>
       withCardApiTimeout(
-        () =>
-          channel.rawClient.cardkit.v1.cardElement.content({
+        async () => checkedCardkitResponse(
+          await channel.rawClient.cardkit.v1.cardElement.content({
             path: { card_id: this.cardId, element_id: elementId },
-            data: { content, sequence: ++this.seq, uuid: `e_${this.cardId}_${this.seq}` },
+            data: { content, sequence: ++this.seq, uuid: 'e_' + this.cardId + '_' + this.seq },
           }),
+        ),
         '内容更新',
       );
     await this.pacer?.wait();
@@ -365,15 +401,16 @@ export class RunCardStream {
           if (code === ERR_STREAMING_OFF) {
             log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, reopenStreaming: true });
             await withCardApiTimeout(
-              () =>
-                channel.rawClient.cardkit.v1.card.settings({
+              async () => checkedCardkitResponse(
+                await channel.rawClient.cardkit.v1.card.settings({
                   path: { card_id: this.cardId },
                   data: {
                     settings: JSON.stringify({ config: { streaming_mode: true } }),
                     sequence: ++this.seq,
-                    uuid: `o_${this.cardId}_${this.seq}`,
+                    uuid: 'o_' + this.cardId + '_' + this.seq,
                   },
                 }),
+              ),
               '流式设置更新',
             );
             await push();
@@ -437,13 +474,9 @@ export class RunCardStream {
     opts: { replyTo?: string; replyInThread?: boolean },
   ): Promise<string> {
     this.pacer = pacerFor(chatId); // shared with the chat's other streams
-    // Feishu's message create/reply accepts a caller UUID and deduplicates the
-    // same request for one hour. Keep it stable across retries: if the first
-    // request reached Feishu but its response was lost, the retry returns the
-    // existing message instead of posting a second visible card. CardKit card
-    // entities have no equivalent idempotency field, so only recreate the entity
-    // for the explicit 11310 propagation error; transport errors keep using the
-    // same already-created card id.
+    const initialData = await serializeRuntimeCard(initialCard, channel.rawClient);
+    // Feishu deduplicates message sends by UUID for one hour. Keep the same UUID
+    // across retries so a lost response cannot create duplicate visible cards.
     const messageUuid = randomUUID();
     let cardId: string | undefined;
     for (let i = 0; ; i++) {
@@ -451,45 +484,41 @@ export class RunCardStream {
       try {
         if (!cardId) {
           const created = await withCardApiTimeout(
-            () =>
-              channel.rawClient.cardkit.v1.card.create({
-                data: { type: 'card_json', data: JSON.stringify(initialCard) },
-              }),
+            async () => checkedCardkitResponse(await channel.rawClient.cardkit.v1.card.create({
+              data: { type: 'card_json', data: initialData },
+            })),
             '创建',
           );
           cardId = (created as { data?: { card_id?: string } }).data?.card_id;
           if (!cardId) {
-            throw new Error(`cardkit.card.create returned no card_id: ${JSON.stringify(created).slice(0, 200)}`);
+            throw new Error('cardkit.card.create returned no card_id: ' + JSON.stringify(created).slice(0, 200));
           }
           this.cardId = cardId;
-          this.lastContent = JSON.stringify(initialCard);
+          this.lastContent = initialData;
         }
 
         const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
         let messageId: string | undefined;
         if (opts.replyTo) {
-          const replyTo = opts.replyTo;
           const r = await withCardApiTimeout(
-            () =>
-              channel.rawClient.im.v1.message.reply({
-                path: { message_id: replyTo },
-                data: {
-                  msg_type: 'interactive',
-                  content,
-                  reply_in_thread: opts.replyInThread ?? false,
-                  uuid: messageUuid,
-                },
-              }),
+            async () => checkedCardkitResponse(await channel.rawClient.im.v1.message.reply({
+              path: { message_id: opts.replyTo! },
+              data: {
+                msg_type: 'interactive',
+                content,
+                reply_in_thread: opts.replyInThread ?? false,
+                uuid: messageUuid,
+              },
+            })),
             '发送',
           );
           messageId = (r as { data?: { message_id?: string } }).data?.message_id;
         } else {
           const r = await withCardApiTimeout(
-            () =>
-              channel.rawClient.im.v1.message.create({
-                params: { receive_id_type: 'chat_id' },
-                data: { receive_id: chatId, msg_type: 'interactive', content, uuid: messageUuid },
-              }),
+            async () => checkedCardkitResponse(await channel.rawClient.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: { receive_id: chatId, msg_type: 'interactive', content, uuid: messageUuid },
+            })),
             '发送',
           );
           messageId = (r as { data?: { message_id?: string } }).data?.message_id;
@@ -502,8 +531,8 @@ export class RunCardStream {
         const transient = isTransientCardError(err);
         if (!cardIdNotReady && !transient) throw err;
         if (cardIdNotReady) {
-          // Feishu explicitly rejected the reference before sending a message;
-          // recreate the entity and try the same idempotent message request.
+          // Feishu explicitly rejected this card reference before sending; only
+          // then recreate the entity. Transport failures reuse the existing id.
           cardId = undefined;
           this.cardId = '';
           this.lastContent = '';
@@ -528,7 +557,7 @@ export class RunCardStream {
    * away when it comes around again. */
   async streamCard(channel: LarkChannel, fullCard: CardObject, force = false): Promise<boolean> {
     if (!this.cardId || this.transportBroken) return false;
-    const data = JSON.stringify(fullCard);
+    const data = await serializeRuntimeCard(fullCard, channel.rawClient);
     if (data === this.lastContent) return true;
     const now = Date.now();
     if (!force && now - this.lastPush < STREAM_THROTTLE_MS) return false;
@@ -540,11 +569,10 @@ export class RunCardStream {
       const t0 = Date.now();
       try {
         await withCardApiTimeout(
-          () =>
-            channel.rawClient.cardkit.v1.card.update({
-              path: { card_id: this.cardId },
-              data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
-            }),
+          async () => checkedCardkitResponse(await channel.rawClient.cardkit.v1.card.update({
+            path: { card_id: this.cardId },
+            data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: 's_' + this.cardId + '_' + this.seq },
+          })),
           '流式更新',
         );
         if (this.transportBroken) return false;
@@ -596,6 +624,35 @@ export class RunCardStream {
     return this.enqueueForcedUpdate(channel, fullCard);
   }
 
+  getCardId(): string { return this.cardId; }
+
+  /** File rows share the whole-card queue and sequence, including demotion. */
+  private readonly elementOverrides = new Map<string, CardElement>();
+
+  updateElement(channel: LarkChannel, elementId: string, element: CardElement): Promise<boolean> {
+    this.elementOverrides.set(elementId, element);
+    const data = JSON.stringify(element);
+    const task = this.forcedUpdateTail.then(async () => {
+      if (!this.cardId) return false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await this.pacer?.wait();
+        try {
+          assertCardkitSuccess(await channel.rawClient.cardkit.v1.cardElement.update({
+            path: { card_id: this.cardId, element_id: elementId },
+            data: { element: data, sequence: ++this.seq, uuid: `f_${this.cardId}_${this.seq}` },
+          }));
+          return true;
+        } catch (err) {
+          log.fail('card', err, { phase: 'file-row-update', retry: attempt === 0 });
+          if (attempt === 0) await new Promise((r) => setTimeout(r, 3200));
+        }
+      }
+      return false;
+    });
+    this.forcedUpdateTail = task.then(() => undefined, () => undefined);
+    return task;
+  }
+
   /**
    * Repaint a still-live card (currently used by the completion-reminder
    * control). Once {@link finalizeCard} has synchronously frozen live repaints,
@@ -623,7 +680,20 @@ export class RunCardStream {
     // Capture the exact frame at invocation time; callers often mutate their
     // RunCardState again while this queued network write is waiting its turn.
     const data = JSON.stringify(fullCard);
-    const task = this.forcedUpdateTail.then(() => this.pushForcedUpdate(channel, data));
+    const task = this.forcedUpdateTail.then(async () => {
+      // Overlay at dispatch time: an already-queued demotion must not restore
+      // a stale "get" button after delivery completed.
+      const frame = JSON.parse(data) as CardBody;
+      const overlay = (el: CardElement): CardElement => {
+        const updated = this.elementOverrides.get(String(el.element_id));
+        if (updated) return updated;
+        if (Array.isArray(el.elements)) el.elements = (el.elements as CardElement[]).map(overlay);
+        if (Array.isArray(el.columns)) el.columns = (el.columns as CardElement[]).map(overlay);
+        return el;
+      };
+      if (frame.body?.elements) frame.body.elements = frame.body.elements.map(overlay);
+      return this.pushForcedUpdate(channel, await serializeRuntimeCard(frame, channel.rawClient));
+    });
     // A surprising transport failure must not poison the serialization tail and
     // prevent the terminal frame. pushForcedUpdate normally absorbs failures,
     // but keep the tail resilient to any future exception too.
@@ -638,11 +708,10 @@ export class RunCardStream {
     if (!this.cardId || this.transportBroken) return false;
     const push = async (): Promise<void> => {
       await withCardApiTimeout(
-        () =>
-          channel.rawClient.cardkit.v1.card.update({
-            path: { card_id: this.cardId },
-            data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `u_${this.cardId}_${this.seq}` },
-          }),
+        async () => checkedCardkitResponse(await channel.rawClient.cardkit.v1.card.update({
+          path: { card_id: this.cardId },
+          data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: 'u_' + this.cardId + '_' + this.seq },
+        })),
         '终态更新',
       );
       this.lastContent = data;
@@ -726,4 +795,24 @@ function structureSig(card: CardObject, eid: string | null): string {
   if (!eid || !Array.isArray(els)) return JSON.stringify(card);
   const blanked = els.map((el) => (el && el.element_id === eid ? { ...el, content: '' } : el));
   return JSON.stringify({ ...(card as object), body: { ...body, elements: blanked } });
+}
+
+/**
+ * The SDK resolves HTTP 200 business failures (`{code: 230099, msg: …}`) instead
+ * of rejecting, so without this check a rejected card write counts as delivered:
+ * `lastContent` advances and the frame is never retried. That silently drops the
+ * TERMINAL frame in particular — the run is over but the card keeps its running
+ * layout with a live ⏹ cursor (issue #14 "一显示就卡"). Throwing here routes the
+ * failure into the existing retry/self-heal paths.
+ */
+function assertCardkitSuccess(response: unknown): void {
+  const result = response as { code?: number; msg?: string } | null;
+  if (typeof result?.code === 'number' && result.code !== 0) {
+    throw Object.assign(new Error(result.msg ?? `cardkit error ${result.code}`), { code: result.code });
+  }
+}
+
+function checkedCardkitResponse<T>(response: T): T {
+  assertCardkitSuccess(response);
+  return response;
 }

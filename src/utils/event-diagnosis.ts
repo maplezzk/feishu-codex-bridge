@@ -5,7 +5,8 @@ import type { TenantBrand } from '../config/schema';
  *
  * 飞书对「添加事件 / 回调 / 发布版本」没有任何**写入类** OpenAPI，但提供了只读的
  * 「获取应用版本列表」（`GET /application/v6/applications/:app_id/app_versions`），
- * 响应里每个版本都带 `events`（已订阅事件列表）与 `status`（1=审核通过/已上架）。
+ * 响应里每个版本的 `event_infos[].event_type` 是事件 ID，`events` 是本地化名称，
+ * `status` 为 1 表示审核通过/已上架。
  * 凭它可把「@机器人没反应」从"等用户发现"变成启动/doctor/诊断卡上的精确三态：
  *
  *   - `unpublished` —— 从未发布过版本（事件订阅尚未生效）；
@@ -15,7 +16,7 @@ import type { TenantBrand } from '../config/schema';
  * 第四态 `unchecked` 是优雅降级：缺 `application:application.app_version:readonly`
  * scope、网络不通、接口报错都归这里——只告知、绝不阻塞启动（项目既有策略）。
  *
- * 注意：`events` 只含「事件配置」标签页的事件；「回调配置」（card.action.trigger
+ * 注意：事件列表只含「事件配置」标签页的事件；「回调配置」（card.action.trigger
  * 卡片回传交互）不在其中，**无法检测**——相关提示仍须保留人工指引。
  */
 
@@ -64,7 +65,12 @@ interface TokenResp {
 interface VersionListResp {
   code?: number;
   msg?: string;
-  data?: { items?: { version?: string; status?: number; events?: string[] }[] };
+  data?: { items?: {
+    version?: string;
+    status?: number;
+    events?: string[];
+    event_infos?: { event_type?: string }[];
+  }[] };
 }
 
 /**
@@ -121,10 +127,32 @@ export async function diagnoseEventSubscription(
     return { state: 'unchecked', reason: `code=${body.code ?? '?'} msg=${body.msg ?? '<no msg>'}${scopeHint}` };
   }
 
-  const live = (body.data?.items ?? []).find((v) => v.status === 1);
+  if (!Array.isArray(body.data?.items)) {
+    return { state: 'unchecked', reason: '版本接口未返回可用的版本列表' };
+  }
+  const live = body.data.items.find((v) => v.status === 1);
   if (!live) return { state: 'unpublished' };
 
-  const events = live.events ?? [];
+  // `events` can contain localized names; only stable IDs establish subscription state.
+  let events: string[];
+  if (live.event_infos !== undefined) {
+    if (!Array.isArray(live.event_infos)) {
+      return { state: 'unchecked', reason: '已发布版本的事件信息格式无效', version: live.version };
+    }
+    const types: string[] = [];
+    for (const event of live.event_infos) {
+      if (!event || typeof event.event_type !== 'string' || event.event_type.length === 0) {
+        return { state: 'unchecked', reason: '已发布版本的事件信息格式无效', version: live.version };
+      }
+      types.push(event.event_type);
+    }
+    events = [...new Set(types)];
+  } else if (Array.isArray(live.events) && live.events.every((event) =>
+    typeof event === 'string' && /^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+$/.test(event))) {
+    events = [...new Set(live.events)];
+  } else {
+    return { state: 'unchecked', reason: '已发布版本未返回可识别的事件 ID', version: live.version };
+  }
   const has = new Set(events);
   const missingRequired = REQUIRED_EVENTS.filter((e) => !has.has(e));
   const missingOptional = OPTIONAL_EVENTS.filter((e) => !has.has(e));
@@ -141,11 +169,11 @@ export async function diagnoseEventSubscription(
 export function summarizeEventDiagnosis(d: EventDiagnosis): string {
   switch (d.state) {
     case 'ok':
-      return `✅ 已生效（版本 v${d.version ?? '?'} 已订阅 ${REQUIRED_EVENTS.join(' / ')}）`;
+      return `✅ 已发布版本 v${d.version ?? '?'} 已订阅 ${REQUIRED_EVENTS.join(' / ')}`;
     case 'missing':
-      return `❌ 已发布版本 v${d.version ?? '?'} 缺事件：${(d.missingRequired ?? []).join('、')} —— @我 不会有反应`;
+      return `❌ 已发布版本 v${d.version ?? '?'} 缺事件：${(d.missingRequired ?? []).join('、')}`;
     case 'unpublished':
-      return '❌ 从未发布过版本 —— 事件订阅尚未生效，@我 不会有反应';
+      return '❌ 未找到已发布版本，请在配置事件后发布版本';
     case 'unchecked':
       return `⚠️ 未能自动检测（${d.reason ?? '未知原因'}）`;
   }

@@ -50,7 +50,7 @@ describe.runIf(LIVE)('resume 原地切 provider LIVE', () => {
     try {
       for await (const ev of thread.runStreamed({ text: '只回复两个字：收到' }).events as AsyncIterable<AgentEvent>) {
         types.push(ev.type);
-        if (ev.type === 'text_delta') text += ev.text;
+        if (ev.type === 'text_delta') text += ev.delta;
       }
     } finally {
       await thread.close().catch(() => undefined);

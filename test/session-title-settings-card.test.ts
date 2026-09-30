@@ -43,7 +43,7 @@ describe('session-title settings cards', () => {
     const rendered = JSON.stringify(buildSettingsCard(cfg()));
     expect(rendered).toContain(DM.sessionTitleSettings);
     expect(rendered).toContain(DM.commentSettings);
-    expect(rendered).toContain('专项功能');
+    expect(rendered).not.toContain('专项功能');
     expect(rendered).toContain('分别配置，互不影响');
     expect(rendered).toContain('会话标题');
     expect(rendered).toContain('当前策略');

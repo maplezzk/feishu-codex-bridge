@@ -158,8 +158,21 @@ function mapItemStart(item: ThreadItem, ctx?: MapContext): AgentEvent | null {
         kind: 'search',
       };
     case 'mcpToolCall':
+      return {
+        type: 'tool_use',
+        itemId: item.id,
+        title: `mcp__${item.server}__${item.tool}`,
+        detail: JSON.stringify(item.arguments, null, 2),
+        kind: 'tool',
+      };
     case 'dynamicToolCall':
-      return { type: 'tool_use', itemId: item.id, title: '工具调用', kind: 'tool' };
+      return {
+        type: 'tool_use',
+        itemId: item.id,
+        title: item.namespace ? `${item.namespace}.${item.tool}` : item.tool,
+        detail: JSON.stringify(item.arguments, null, 2),
+        kind: 'tool',
+      };
     case 'collabAgentToolCall':
       return { type: 'tool_use', itemId: item.id, title: collabTitle(item), kind: 'tool' };
     default:
@@ -185,9 +198,24 @@ function mapItemComplete(item: ThreadItem): AgentEvent | null {
     case 'fileChange':
       return { type: 'tool_result', itemId: item.id, output: fileChangeDiffMd(item.changes) };
     case 'webSearch':
-    case 'mcpToolCall':
-    case 'dynamicToolCall':
       return { type: 'tool_result', itemId: item.id };
+    case 'mcpToolCall':
+      return {
+        type: 'tool_result',
+        itemId: item.id,
+        output: item.error
+          ? JSON.stringify({ result: item.result, error: item.error }, null, 2)
+          : item.result === null ? undefined : JSON.stringify(item.result, null, 2),
+        exitCode: item.status === 'failed' || item.error !== null ? 1 : undefined,
+      };
+    case 'dynamicToolCall':
+      return {
+        type: 'tool_result',
+        itemId: item.id,
+        output: item.contentItems?.map((content) => content.type === 'inputText'
+          ? content.text : JSON.stringify(content)).join('\n'),
+        exitCode: item.status === 'failed' || item.success === false ? 1 : undefined,
+      };
     case 'collabAgentToolCall':
       return {
         type: 'tool_result',

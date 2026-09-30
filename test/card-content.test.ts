@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   assessRawCardContent,
+  cardTextForAgent,
   extractRawCardText,
   fetchInteractiveCardContent,
   isDegradedCardContent,
@@ -236,6 +237,124 @@ describe('assessRawCardContent / fetchInteractiveCardContent', () => {
       complete: false,
       reason: 'title-only',
     });
+  });
+
+  it('reads native table rows and cells from an alert card', () => {
+    const result = assessRawCardContent({
+      header: { title: { tag: 'plain_text', content: 'OMS和ERP订单状态不一致报警' } },
+      body: {
+        elements: [{
+          tag: 'table',
+          columns: [
+            { name: 'erp订单号' },
+            { name: '订单明细更新sql' },
+            { name: '订单状态更新sql' },
+            { name: '下单时间' },
+          ],
+          rows: [{ cells: [
+            { text: '132475108' },
+            { text: 'update order_detail set package_id = 37728751 where erp_order_detail_id in (787320316);' },
+            { text: 'update order set logistics_status = 2 where erp_order_id = 132475108;' },
+            { text: '2026-08-12 10:55:02' },
+          ] }],
+        }],
+      },
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.text).toContain('132475108');
+    expect(result.text).toContain('update order_detail set package_id = 37728751');
+    expect(result.text).toContain('2026-08-12 10:55:02');
+  });
+
+  it('reads Card 2.0 table columns and keyed rows from the raw Feishu response', () => {
+    const cell = (content: string) => ({
+      data: { tag: 'markdown', property: { elements: [
+        { tag: 'plain_text', property: { content } },
+      ] } },
+    });
+    const result = assessRawCardContent({
+      header: { tag: 'card_header', property: {
+        title: { tag: 'plain_text', property: { content: '合包集箱拣货单关系异常' } },
+      } },
+      body: { tag: 'body', property: { elements: [{ tag: 'markdown', property: { elements: [
+        { tag: 'plain_text', property: { content: '请在仓库签收前处理。' } },
+        { tag: 'table', property: {
+          columns: [
+            { name: '0', displayName: '集箱号' },
+            { name: '1', displayName: '后序仓ID' },
+            { name: '7', displayName: '已有拣货单ID' },
+          ],
+          rows: [{
+            '0': cell('81654'),
+            '1': cell('93'),
+            '7': cell('12314652,12314705,12314650,12314704'),
+          }],
+        } },
+      ] } }] } },
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.text).toContain('集箱号：81654');
+    expect(result.text).toContain('后序仓ID：93');
+    expect(result.text).toContain('已有拣货单ID：12314652,12314705,12314650,12314704');
+    expect(result.text).not.toMatch(/^0$|^1$|^7$/m);
+  });
+
+  it('keeps multiple table rows and repeated values associated with their columns', () => {
+    const result = assessRawCardContent({
+      header: { title: { tag: 'plain_text', content: '集箱列表' } },
+      body: { elements: [{ tag: 'table', columns: [
+        { name: '0', displayName: '集箱号' },
+        { name: '1', displayName: '后序仓ID' },
+      ], rows: [
+        { cells: [{ text: '81654' }, { text: '93' }] },
+        { cells: [{ text: '81654' }, { text: '93' }] },
+      ] }] },
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.text).toContain('表格第1行：集箱号：81654；后序仓ID：93');
+    expect(result.text).toContain('表格第2行：集箱号：81654；后序仓ID：93');
+  });
+
+  it('reads table data when styling is wrapped in property and rows remain direct', () => {
+    const result = assessRawCardContent({
+      header: { title: { tag: 'plain_text', content: '集箱告警' } },
+      body: { elements: [{
+        tag: 'table',
+        property: { headerStyle: { bold: true } },
+        columns: [{ name: 'box', displayName: '集箱号' }],
+        rows: [{ box: { text: '81654' } }],
+      }] },
+    });
+
+    expect(result).toEqual({ text: '集箱告警\n表格第1行：集箱号：81654', complete: true });
+  });
+
+  it('marks a card with an unreadable table cell as incomplete despite other body text', () => {
+    const result = assessRawCardContent({
+      header: { title: { tag: 'plain_text', content: '仓库告警' } },
+      body: { elements: [
+        { tag: 'plain_text', content: '请处理以下异常。' },
+        { tag: 'table', columns: [{ name: '0', displayName: '集箱号' }],
+          rows: [{ '0': { data: { unsupported_cell_payload: { opaque: true } } } }] },
+      ] },
+    });
+
+    expect(result.complete).toBe(false);
+    expect(result.reason).toBe('table-unreadable');
+  });
+
+  it('warns the agent when a multi-line card preview hides unreadable table cells', () => {
+    const visible = cardTextForAgent('仓库告警\n请处理以下异常。\n0\n1', {
+      text: '仓库告警\n请处理以下异常。\n0\n1',
+      complete: false,
+      reason: 'table-unreadable',
+    });
+
+    expect(visible).toContain('内容没有完整读取成功');
+    expect(visible).toContain('不要根据标题、摘要、历史上下文或常识猜测缺失内容');
   });
 
   it('marks a direct card with a readable body as complete', () => {

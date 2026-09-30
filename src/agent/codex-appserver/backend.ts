@@ -26,7 +26,7 @@ import { refillWarmPool, takeWarmClient, utilityRequest } from './client-pool';
 import { mapNotification } from './event-map';
 import { codexVersionAsync, resolveCodexBin } from './locate';
 import { defaultModelProvider } from './usage';
-import type { ServerNotification, Thread, ThreadItem, Turn } from './protocol';
+import type { ServerNotification, Thread, ThreadItem, Turn, TurnStartResponse } from './protocol';
 
 const APPROVAL_POLICY = 'never';
 
@@ -335,7 +335,6 @@ class CodexThread implements AgentThread {
 
   runStreamed(input: AgentInput, turn?: TurnOptions): AgentRun {
     const self = this;
-    this.currentTurnId = undefined;
     // Per-turn overrides persist for subsequent turns (matches turn/start semantics).
     if (turn?.model) this.model = turn.model;
     if (turn?.effort) this.effort = turn.effort;
@@ -357,61 +356,73 @@ class CodexThread implements AgentThread {
     // The caller owns the new failure mode (card setup throws after the turn
     // started): launchRun aborts+closes the thread on that path.
     //
-    // The RPC response identifies OUR turn. Resume/goal notifications can still
-    // be buffered here; accepting their completion would close the new card.
-    // Observe rejection immediately even when card setup delays consumption.
-    const started = self.client.request<{ turn: { id: string } }>('turn/start', params)
-      .then(
-        (response) => ({ response, error: undefined }),
-        (error: unknown) => ({ response: undefined, error: error instanceof Error ? error : new Error(String(error)) }),
-      );
+    // Live probe (2026-09-15): ACK returned in 12ms, before turn/started.
+    // The response identifies THIS request's turn. Notifications can arrive
+    // before it and stay buffered in the client; never infer identity from the
+    // first turn/started (it may belong to an old turn or a subagent).
+    // Observe rejection eagerly, even if card creation delays consumption.
+    let activeTurnId: string | undefined;
+    const started = self.client.request<TurnStartResponse>('turn/start', params)
+      .then((result) => {
+        if (!result.turn?.id) throw new Error('turn/start response missing turn id');
+        activeTurnId = result.turn.id;
+        return { turnId: result.turn.id };
+      })
+      .catch((err: unknown) => {
+        const error = err instanceof Error ? err : new Error(String(err));
+        log.fail('agent', error, { phase: 'turn/start' });
+        return { error };
+      });
     async function* gen(): AsyncGenerator<AgentEvent> {
-      const result = await started;
-      if (result.error || !result.response?.turn?.id) {
-        const error = result.error ?? new Error('turn/start response is missing turn.id');
-        log.fail('agent', error, { phase: 'turn/start', sessionId: self.sessionId });
-        yield { type: 'error', message: error.message, willRetry: false };
-        return;
-      }
-      const turnId = result.response.turn.id;
-      self.currentTurnId = turnId;
-      log.info('agent', 'turn-bound', { sessionId: self.sessionId, turnId });
-      for await (const notification of self.client.stream()) {
-        const scope = notification.params as { threadId?: string; turnId?: string; turn?: { id: string } };
-        const eventTurnId = scope.turnId ?? scope.turn?.id;
-        // One app-server client is dedicated to this parent thread. Codex
-        // subagents are represented by child thread/turn ids on that same
-        // connection, so every raw notification from the client is evidence of
-        // liveness even when it is not part of the parent's rendered stream.
-        // Updating before the scope filter prevents a busy child from looking
-        // idle to the bridge watchdog and getting killed while it is working.
-        lastActivityAt = Date.now();
-        if ((scope.threadId && scope.threadId !== self.sessionId) ||
-            (eventTurnId && eventTurnId !== turnId)) {
-          if (notification.method === 'turn/completed' || notification.method === 'turn/started') {
-            log.info('agent', 'turn-event-ignored', {
-              sessionId: self.sessionId, turnId, eventThreadId: scope.threadId,
-              eventTurnId, method: notification.method,
-            });
-            if (eventTurnId && eventTurnId !== turnId) {
-              log.info('agent', 'subagent-activity', {
-                sessionId: self.sessionId,
-                parentTurnId: turnId,
-                childTurnId: eventTurnId,
-                method: notification.method,
-              });
-            }
-          }
-          continue;
+      try {
+        const result = await started;
+        if ('error' in result) {
+          yield { type: 'error', message: result.error.message, willRetry: false };
+          return;
         }
-        const ev = mapNotification(notification);
-        if (!ev) continue;
-        yield ev;
-        if (ev.type === 'done') return;
-        if (ev.type === 'error' && !ev.willRetry) return;
+        // Do not race stream.next() with start failure: the losing read would
+        // remain queued and steal the next request's first notification.
+        for await (const notification of self.client.stream()) {
+          const p = notification.params;
+          const scope = p as { threadId?: string; turnId?: string; turn?: { id?: string } };
+          const eventTurnId = scope.turnId ?? scope.turn?.id;
+          // This client is dedicated to the parent thread, but Codex subagent
+          // notifications share it. Count every raw notification as liveness
+          // before filtering so busy child work cannot trip the parent's idle
+          // watchdog. Only parent/current-turn events reach the card.
+          lastActivityAt = Date.now();
+          if ((scope.threadId && scope.threadId !== self.sessionId) ||
+              (eventTurnId && eventTurnId !== result.turnId)) {
+            if (notification.method === 'turn/completed' || notification.method === 'turn/started') {
+              log.info('agent', 'turn-event-ignored', {
+                sessionId: self.sessionId, turnId: result.turnId, eventThreadId: scope.threadId,
+                eventTurnId, method: notification.method,
+              });
+              if (eventTurnId && eventTurnId !== result.turnId) {
+                log.info('agent', 'subagent-activity', {
+                  sessionId: self.sessionId,
+                  parentTurnId: result.turnId,
+                  childTurnId: eventTurnId,
+                  method: notification.method,
+                });
+              }
+            }
+            continue;
+          }
+          const ev = mapNotification(notification);
+          if (!ev) continue;
+          if (ev.type === 'done' || (ev.type === 'error' && !ev.willRetry)) {
+            activeTurnId = undefined; // no steering during terminal-card I/O
+            yield ev;
+            return;
+          }
+          yield ev;
+        }
+      } finally {
+        activeTurnId = undefined;
       }
     }
-    return { events: gen(), turnId: () => self.currentTurnId, lastActivity: () => lastActivityAt };
+    return { events: gen(), turnId: () => activeTurnId, lastActivity: () => lastActivityAt };
   }
 
   runGoal(objective: string): AgentRun {
@@ -457,48 +468,53 @@ class CodexThread implements AgentThread {
       let armed = false;
       let turnActive = false;
       let goalDone = false; // a terminal goal status was seen; drain the live turn, then stop
-      while (true) {
-        const step = await Promise.race([stream.next(), setFailed]);
-        if (step === 'set-failed') {
-          yield { type: 'error', message: setError?.message ?? 'thread/goal/set 请求失败', willRetry: false };
-          return;
-        }
-        if (step.done) return;
-        lastActivityAt = Date.now();
-        const ev = mapNotification(step.value);
-        if (!ev) continue;
-        if (ev.type === 'turn_started') {
-          self.currentTurnId = ev.turnId;
-          armed = true; // a real turn for our goal is running
-          turnActive = true;
-          yield ev;
-          continue;
-        }
-        if (ev.type === 'done') {
-          turnActive = false;
-          yield ev;
-          // The goal is terminal AND its final turn just finished — now stop.
-          if (goalDone) return;
-          continue;
-        }
-        if (ev.type === 'goal_update') {
-          if (ev.objective !== objective) continue; // stale snapshot for a different goal
-          if (ev.status === 'active' || ev.status === 'paused') armed = true;
-          yield ev;
-          // A goal spans many auto-continued turns — a per-turn `done` is NOT the
-          // end. On a terminal goal status: codex emits update_goal(complete) BEFORE
-          // the model's closing answer (verified — the final agentMessage arrives a
-          // couple seconds AFTER goal/complete), so returning here would cut the
-          // result off. If a turn is in flight, keep consuming until its turn/completed
-          // so the final answer renders; otherwise stop now.
-          if (armed && isGoalTerminal(ev.status)) {
-            if (turnActive) goalDone = true;
-            else return;
+      try {
+        while (true) {
+          const step = await Promise.race([stream.next(), setFailed]);
+          if (step === 'set-failed') {
+            yield { type: 'error', message: setError?.message ?? 'thread/goal/set 请求失败', willRetry: false };
+            return;
           }
-          continue;
+          if (step.done) return;
+          lastActivityAt = Date.now();
+          const ev = mapNotification(step.value);
+          if (!ev) continue;
+          if (ev.type === 'turn_started') {
+            self.currentTurnId = ev.turnId;
+            armed = true; // a real turn for our goal is running
+            turnActive = true;
+            yield ev;
+            continue;
+          }
+          if (ev.type === 'done') {
+            turnActive = false;
+            yield ev;
+            // The goal is terminal AND its final turn just finished — now stop.
+            if (goalDone) return;
+            continue;
+          }
+          if (ev.type === 'goal_update') {
+            if (ev.objective !== objective) continue; // stale snapshot for a different goal
+            if (ev.status === 'active' || ev.status === 'paused') armed = true;
+            yield ev;
+            // A goal spans many auto-continued turns — a per-turn `done` is NOT the
+            // end. On a terminal goal status: codex emits update_goal(complete) BEFORE
+            // the model's closing answer (verified — the final agentMessage arrives a
+            // couple seconds AFTER goal/complete), so returning here would cut the
+            // result off. If a turn is in flight, keep consuming until its turn/completed
+            // so the final answer renders; otherwise stop now.
+            if (armed && isGoalTerminal(ev.status)) {
+              if (turnActive) goalDone = true;
+              else return;
+            }
+            continue;
+          }
+          yield ev;
+          if (ev.type === 'error' && !ev.willRetry) return; // a fatal error kills the run
         }
-        yield ev;
-        if (ev.type === 'error' && !ev.willRetry) return; // a fatal error kills the run
+      } finally {
+        await stream.return?.();
+        self.currentTurnId = undefined;
       }
     }
     return { events: gen(), turnId: () => self.currentTurnId, lastActivity: () => lastActivityAt };
@@ -513,7 +529,7 @@ class CodexThread implements AgentThread {
       threadId: this.sessionId,
       expectedTurnId,
       input: toUserInput(input),
-    });
+    }, 30_000);
   }
 
   async abort(turnId: string): Promise<void> {
@@ -549,7 +565,10 @@ class CodexThread implements AgentThread {
       while (true) {
         const step = await Promise.race([stream.next(), startFailed, timeout]);
         if (step === 'start-failed') throw startError ?? new Error('thread/compact/start 请求失败');
-        if (step === 'timeout') throw new Error(`压缩超时（codex 未在 ${COMPACT_TIMEOUT_MS / 1000}s 内完成）`);
+        if (step === 'timeout') {
+          void this.close().catch(() => undefined);
+          throw new Error(`压缩超时（codex 未在 ${COMPACT_TIMEOUT_MS / 1000}s 内完成）`);
+        }
         if (step.done) break;
         const ev = mapNotification(step.value);
         if (!ev) continue;
@@ -560,6 +579,7 @@ class CodexThread implements AgentThread {
       }
     } finally {
       if (timer) clearTimeout(timer);
+      await stream.return?.();
     }
     return { compacted, usage };
   }

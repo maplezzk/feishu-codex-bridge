@@ -37,6 +37,7 @@ import {
 
 /** Web/IPC 写操作的序列化形态（supervisor → bot 子进程经 process.send 转发）。 */
 export type AdminWriteOp =
+  | { kind: 'voice'; value: import('../voice/types').VoiceAction }
   | { kind: 'switchBackend'; project: string; backend: string }
   | {
       kind: 'setPermissionMode';
@@ -347,6 +348,7 @@ export async function performSetCompletionReminder(opts: {
 }
 
 export interface AdminWriteExecutorDeps {
+  voiceAction?: (action: import('../voice/types').VoiceAction) => Promise<void>;
   backendFor: (id?: string) => AgentBackend;
   evictLiveSessionsForChat: (chatId: string) => Promise<void>;
   /** LIVE bot config；setCompletionReminder 需要它来热更新运行态。 */
@@ -374,8 +376,12 @@ export function createAdminWriteExecutor(deps: AdminWriteExecutorDeps): (op: Adm
 export async function runAdminWriteOp(
   op: AdminWriteOp,
   deps: AdminWriteExecutorDeps,
-): Promise<AdminWriteOutcome | AdminPreferencesWriteOutcome> {
+): Promise<AdminWriteOutcome | AdminPreferencesWriteOutcome | { ok: true }> {
   switch (op.kind) {
+    case 'voice':
+      if (!deps.voiceAction) return { ok: false, reason: '语音服务未就绪' };
+      try { await deps.voiceAction(op.value); return { ok: true }; }
+      catch (err) { return { ok: false, reason: err instanceof Error ? err.message : '语音设置失败' }; }
     case 'switchBackend':
       return performBackendSwitch({ projectName: op.project, target: op.backend, backendFor: deps.backendFor });
     case 'setPermissionMode':

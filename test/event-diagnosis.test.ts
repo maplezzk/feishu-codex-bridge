@@ -56,6 +56,58 @@ describe('diagnoseEventSubscription — 三态 + unchecked 降级', () => {
     expect(d.events).toEqual(ALL_EVENTS);
   });
 
+  it('reads stable event types when events contains localized display names', async () => {
+    const d = await diagnoseEventSubscription('cli_x', 's', 'feishu', fetchStub({
+      versions: { code: 0, data: { items: [{
+        version: '1.0.7', status: 1,
+        events: ['接收消息', '机器人自定义菜单事件'],
+        event_infos: [
+          { event_type: 'im.message.receive_v1', event_name: '接收消息' },
+          { event_type: 'application.bot.menu_v6', event_name: '机器人自定义菜单事件' },
+        ],
+      }] } },
+    }));
+    expect(d.state).toBe('ok');
+    expect(d.events).toEqual(['im.message.receive_v1', 'application.bot.menu_v6']);
+    expect(d.missingRequired).toEqual([]);
+    expect(d.missingOptional).not.toContain('application.bot.menu_v6');
+  });
+
+  it('uses event_infos as authoritative even when events claims a required ID', async () => {
+    const d = await diagnoseEventSubscription('cli_x', 's', 'feishu', fetchStub({
+      versions: { code: 0, data: { items: [{
+        version: '1.0.7', status: 1, events: ['im.message.receive_v1'],
+        event_infos: [{ event_type: 'application.bot.menu_v6' }],
+      }] } },
+    }));
+    expect(d.state).toBe('missing');
+    expect(d.events).toEqual(['application.bot.menu_v6']);
+    expect(d.missingRequired).toEqual(['im.message.receive_v1']);
+  });
+
+  it.each([
+    { events: ['接收消息'] },
+    {},
+    { event_infos: null },
+    { event_infos: [{ event_type: 'im.message.receive_v1' }, {}] },
+    { event_infos: [null] },
+  ])('reports unknown metadata as unchecked rather than missing: %j', async (metadata) => {
+    const d = await diagnoseEventSubscription('cli_x', 's', 'feishu', fetchStub({
+      versions: { code: 0, data: { items: [{ version: '1.0', status: 1, ...metadata }] } },
+    }));
+    expect(d.state).toBe('unchecked');
+    expect(d.reason).toBeTruthy();
+    expect(d.missingRequired).toBeUndefined();
+  });
+
+  it('treats an explicitly empty structured list as authoritative', async () => {
+    const d = await diagnoseEventSubscription('cli_x', 's', 'feishu', fetchStub({
+      versions: { code: 0, data: { items: [{ status: 1, events: ALL_EVENTS, event_infos: [] }] } },
+    }));
+    expect(d.state).toBe('missing');
+    expect(d.missingRequired).toEqual(['im.message.receive_v1']);
+  });
+
   it('missing：已发布但缺 im.message.receive_v1', async () => {
     const d = await diagnoseEventSubscription('cli_x', 's', 'feishu', fetchStub({
       versions: {
@@ -152,12 +204,12 @@ describe('diagnoseEventSubscription — 三态 + unchecked 降级', () => {
 
 describe('summarizeEventDiagnosis — 一行中文摘要', () => {
   it('四态各有可读输出', () => {
-    expect(summarizeEventDiagnosis({ state: 'ok', version: '1.0.2' })).toContain('已生效');
+    expect(summarizeEventDiagnosis({ state: 'ok', version: '1.0.2' })).toContain('已订阅');
     expect(summarizeEventDiagnosis({ state: 'ok', version: '1.0.2' })).toContain('v1.0.2');
     expect(
       summarizeEventDiagnosis({ state: 'missing', version: '1.0.0', missingRequired: ['im.message.receive_v1'] }),
     ).toContain('im.message.receive_v1');
-    expect(summarizeEventDiagnosis({ state: 'unpublished' })).toContain('从未发布');
+    expect(summarizeEventDiagnosis({ state: 'unpublished' })).toContain('未找到已发布版本');
     expect(summarizeEventDiagnosis({ state: 'unchecked', reason: 'HTTP 503' })).toContain('HTTP 503');
   });
 });

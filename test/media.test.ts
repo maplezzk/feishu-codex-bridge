@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import {
   cleanFileName,
+  forwardedImageRefs,
   imageKeysFromContent,
   messageHasFiles,
   messageHasImages,
@@ -70,6 +71,29 @@ describe('imageKeysFromContent', () => {
     expect(imageKeysFromContent('image', JSON.stringify({})).length).toBe(0);
     expect(imageKeysFromContent('image', 'not json')).toEqual([]);
     expect(imageKeysFromContent('image', undefined)).toEqual([]);
+  });
+});
+
+describe('forwardedImageRefs', () => {
+  it('uses the outer merge_forward ID with image keys found on child messages', () => {
+    const refs = forwardedImageRefs('om_forward_root', [
+      { message_id: 'om_forward_root', msg_type: 'merge_forward', body: { content: '{}' } },
+      {
+        message_id: 'om_child_image',
+        msg_type: 'image',
+        body: { content: JSON.stringify({ image_key: 'img_v3_forwarded' }) },
+      },
+      {
+        message_id: 'om_child_post',
+        msg_type: 'post',
+        body: { content: JSON.stringify({ content: [[{ tag: 'img', image_key: 'img_v3_post' }]] }) },
+      },
+    ]);
+
+    expect(refs).toEqual([
+      { messageId: 'om_forward_root', fileKey: 'img_v3_forwarded' },
+      { messageId: 'om_forward_root', fileKey: 'img_v3_post' },
+    ]);
   });
 });
 

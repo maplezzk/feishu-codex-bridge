@@ -1,3 +1,6 @@
+/** Request rejected locally before any transport write: safe to resubmit. */
+export class UnsentRequestError extends Error {}
+
 /**
  * Backend-agnostic agent interface. The codex app-server implementation lives
  * in ./codex-appserver; this layer lets the bot orchestrator stay decoupled
@@ -24,6 +27,12 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
  * (restricted token); on Linux/WSL it can't, so those tiers fail-closed there.
  */
 export type PermissionMode = 'qa' | 'write' | 'full';
+
+/** What a turn runs as when no project policy resolved a mode: the middle tier —
+ * confined to the project folder, never the historical whole-machine `full`.
+ * Consumers that receive an OPTIONAL mode (a caller may not have a project yet)
+ * read this ONE constant instead of each carrying its own `?? 'write'`. */
+export const DEFAULT_PERMISSION_MODE: PermissionMode = 'write';
 
 export interface AgentInput {
   text?: string;
@@ -216,6 +225,7 @@ export interface AgentThread {
    * reactivate when the thread is later resumed. Best-effort. */
   clearGoal(): Promise<void>;
   /** inject input into the in-flight turn (引导) */
+  readonly supportsSteer?: boolean;
   steer(input: AgentInput, expectedTurnId: string): Promise<void>;
   /** interrupt the in-flight turn (watchdog 中止) */
   abort(turnId: string): Promise<void>;

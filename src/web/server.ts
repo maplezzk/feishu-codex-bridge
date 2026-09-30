@@ -1,9 +1,11 @@
+import { validateVoiceAction } from '../voice/service';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, watch, type FSWatcher } from 'node:fs';
 import { open, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { paths } from '../config/paths';
+import { buildEventConfigUrl } from '../config/scopes';
 import {
   COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES,
   COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES,
@@ -322,6 +324,31 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     if (req.method === 'GET' && setupMatch) {
       const status = await opts.service.getSetupStatus(decodeURIComponent(setupMatch[1]!));
       sendJson(res, 200, status);
+      return;
+    }
+
+    // Voice config stays in the owning bot process (also under supervisor IPC).
+    const voiceMatch = /^\/api\/bots\/([A-Za-z0-9_-]+)\/voice$/.exec(pathName);
+    if (voiceMatch && (req.method === 'GET' || req.method === 'POST')) {
+      const botId = voiceMatch[1]!;
+      if (req.method === 'GET') {
+        sendJson(res, 200, await opts.service.getVoice(botId));
+        return;
+      }
+      let action;
+      try { action = validateVoiceAction(await readJsonBody(req)); }
+      catch (err) {
+        sendJson(res, 400, { error: 'invalid_input', message: err instanceof Error ? err.message : '无效的语音设置' });
+        return;
+      }
+      try {
+        await opts.service.setVoice(botId, action);
+        sendJson(res, 200, { ok: true });
+      } catch (err) {
+        if (err instanceof NotWiredYetError) sendJson(res, 501, { error: 'not_wired_yet', message: err.message });
+        else if (err instanceof AdminWriteError) sendJson(res, 409, { error: 'write_rejected', message: err.message });
+        else sendJson(res, 500, { error: 'voice_failed', message: '语音设置失败，请检查机器人运行状态后重试' });
+      }
       return;
     }
 
@@ -719,12 +746,15 @@ export function createWebServer(opts: WebServerOptions): WebServer {
 
   /** GET /api/diagnosis —— 事件订阅三态 + 各后端环境体检（按需，较慢）。 */
   async function handleDiagnosis(res: ServerResponse, botParam: string | null): Promise<void> {
-    const botId = botParam ?? (await defaultBotId());
+    const bots = await opts.service.listBots();
+    const botId = botParam ?? (bots.find((b) => b.current) ?? bots[0])?.appId;
+    const bot = bots.find((b) => b.appId === botId);
     const [backends, event] = await Promise.all([
       opts.service.doctorBackends(),
       botId ? opts.service.eventDiagnosis(botId) : Promise.resolve(undefined),
     ]);
-    sendJson(res, 200, { bot: botId, backends, event });
+    const eventConfigUrl = bot ? buildEventConfigUrl(bot.appId, bot.tenant) : undefined;
+    sendJson(res, 200, { bot: botId, backends, event, eventConfigUrl });
   }
 
   /**
@@ -818,14 +848,19 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       mkdirSync(logDir, { recursive: true });
       watcher = watch(logDir, () => void pump());
     } catch {
-      /* 监听失败 → 退化为只有心跳；下一棒可换轮询 */
+      // 轮询仍会补送日志；保留心跳维持 SSE 连接。
     }
+    // macOS/Windows 的目录 watch 偶发漏掉文件追加事件。定期补读 offset，
+    // 让日志流最终能跟上，而不必等用户刷新页面。
+    const poller = setInterval(() => void pump(), 1000);
+    poller.unref();
     const heartbeat = setInterval(() => res.write(': ka\n\n'), 15_000);
 
     const cleanup = (): void => {
       if (closed) return;
       closed = true;
       clearInterval(heartbeat);
+      clearInterval(poller);
       try {
         watcher?.close();
       } catch {

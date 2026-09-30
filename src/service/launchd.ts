@@ -4,10 +4,12 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { homedir, userInfo } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { normalizeServiceCodexBin, saveServiceCodexBin, selectInstallCodexBin } from './codex-bin';
 import {
   ensureLogFiles,
   serviceStderrPath,
   serviceStdoutPath,
+  type ServiceDefinitionOptions,
   type ServiceStatus,
 } from './common';
 
@@ -37,17 +39,18 @@ function escapeXml(value: string): string {
     .replace(/"/g, '&quot;');
 }
 
-export function buildPlist(): string {
+export function buildPlist(options: ServiceDefinitionOptions & { label?: string } = {}): string {
   const nodePath = process.execPath;
-  const cliBinPath = resolveCliBinPath();
-  const pathEnv = process.env.PATH ?? '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin';
+  const cliBinPath = options.cliBinPath ?? resolveCliBinPath();
+  const pathEnv = options.envPath ?? process.env.PATH ?? '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin';
+  const codexBin = normalizeServiceCodexBin(options.codexBin === undefined ? process.env.CODEX_BIN : options.codexBin);
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${LAUNCHD_LABEL}</string>
+  <string>${escapeXml(options.label ?? LAUNCHD_LABEL)}</string>
   <key>ProgramArguments</key>
   <array>
     <string>${escapeXml(nodePath)}</string>
@@ -59,24 +62,29 @@ export function buildPlist(): string {
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${escapeXml(serviceStdoutPath())}</string>
+  <string>${escapeXml(options.stdoutPath ?? serviceStdoutPath())}</string>
   <key>StandardErrorPath</key>
-  <string>${escapeXml(serviceStderrPath())}</string>
+  <string>${escapeXml(options.stderrPath ?? serviceStderrPath())}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
     <string>${escapeXml(pathEnv)}</string>
-  </dict>
+${codexBin !== undefined ? `    <key>CODEX_BIN</key>
+    <string>${escapeXml(codexBin ?? '')}</string>
+` : ''}  </dict>
 </dict>
 </plist>
 `;
 }
 
 export async function installLaunchd(): Promise<ServiceStatus> {
+  const codexBin = selectInstallCodexBin();
   const plistPath = launchAgentPlistPath();
   await mkdir(dirname(plistPath), { recursive: true });
   await ensureLogFiles();
-  await writeFile(plistPath, buildPlist(), 'utf8');
+  await writeFile(plistPath, buildPlist({ codexBin }), 'utf8');
+  // Save before bootout: an in-service caller may be terminated with its job.
+  saveServiceCodexBin(codexBin);
 
   if (isLoaded()) {
     const bootout = runLaunchctl(['bootout', serviceTarget()]);

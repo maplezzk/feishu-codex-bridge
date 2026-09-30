@@ -26,6 +26,7 @@ export interface ToolEntry {
 }
 
 export type Block =
+  | { kind: 'reasoning'; id: string; content: string; streaming: boolean }
   | { kind: 'text'; id: string; content: string; streaming: boolean }
   | { kind: 'tool'; tool: ToolEntry };
 
@@ -38,8 +39,20 @@ export interface ReasoningItem {
 export type FooterStatus = 'thinking' | 'tool_running' | 'streaming' | 'retrying' | null;
 export type Terminal = 'running' | 'done' | 'interrupted' | 'error' | 'idle_timeout';
 
+/** 自动重试的运行时状态：terminal 仍是 'running'（这一轮没结束），卡上显示进度。 */
+export interface RetryState {
+  /** 第几次重试（从 1 起） */
+  attempt: number;
+  /** 重试上限（100） */
+  maxAttempts: number;
+  /** 距离下次尝试的等待秒数；0 = 正在重试（等待已结束） */
+  delaySeconds: number;
+}
+
 export interface RunState {
-  /** text + tool blocks in arrival order (text/tool interleave preserved) */
+  startedAt?: number;
+  completedAt?: number;
+  /** reasoning + text + tool blocks in arrival order (text/tool interleave preserved) */
   blocks: Block[];
   /** reasoning items, keyed by id so deltas + final reconcile without dupes */
   reasoning: ReasoningItem[];
@@ -49,6 +62,8 @@ export interface RunState {
   errorMsg?: string;
   /** set when terminal === 'idle_timeout' — seconds idle before watchdog gave up */
   idleTimeoutSeconds?: number;
+  /** 非空 = 这一轮正在自动重试（看门狗判死后把同一轮重发） */
+  retry?: RetryState;
   /** latest context-window usage (from context_usage events); drives the run
    * card's lower-left occupancy footer. `window` null when codex reports no window. */
   usage?: { used: number; window: number | null };
@@ -86,15 +101,15 @@ export function finalMessageText(state: RunState): string {
 }
 
 function closeStreamingText(blocks: Block[]): Block[] {
-  return blocks.map((b) => (b.kind === 'text' && b.streaming ? { ...b, streaming: false } : b));
+  return blocks.map((b) => (b.kind !== 'tool' && b.streaming ? { ...b, streaming: false } : b));
 }
 
-function upsertText(blocks: Block[], id: string, mutate: (prev: string) => string): Block[] {
-  const idx = blocks.findIndex((b) => b.kind === 'text' && b.id === id);
+function upsertText(blocks: Block[], id: string, mutate: (prev: string) => string, kind: 'text' | 'reasoning' = 'text'): Block[] {
+  const idx = blocks.findIndex((b) => b.kind === kind && b.id === id);
   if (idx === -1) {
-    return [...blocks, { kind: 'text', id, content: mutate(''), streaming: true }];
+    return [...closeStreamingText(blocks), { kind, id, content: mutate(''), streaming: true }];
   }
-  const prev = blocks[idx] as Extract<Block, { kind: 'text' }>;
+  const prev = blocks[idx] as Exclude<Block, { kind: 'tool' }>;
   const next: Block = { ...prev, content: mutate(prev.content) };
   return [...blocks.slice(0, idx), next, ...blocks.slice(idx + 1)];
 }
@@ -135,6 +150,7 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
     case 'thinking_delta':
       return {
         ...state,
+        blocks: upsertText(state.blocks, evt.itemId, (prev) => prev + evt.delta, 'reasoning'),
         reasoning: upsertReasoning(state.reasoning, evt.itemId, (prev) => prev + evt.delta),
         reasoningActive: true,
         footer: state.footer === 'streaming' ? state.footer : 'thinking',
@@ -143,10 +159,22 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
     case 'thinking':
       return {
         ...state,
+        blocks: upsertText(state.blocks, evt.itemId, () => evt.text, 'reasoning').map(b =>
+          b.kind === 'reasoning' && b.id === evt.itemId ? { ...b, streaming: false } : b),
         reasoning: upsertReasoning(state.reasoning, evt.itemId, () => evt.text),
       };
 
     case 'tool_use': {
+      const existing = state.blocks.findIndex(b => b.kind === 'tool' && b.tool.id === evt.itemId);
+      if (existing >= 0) {
+        return {
+          ...state,
+          blocks: state.blocks.map((b, index) => index === existing && b.kind === 'tool'
+            ? { ...b, tool: { ...b.tool, title: evt.title,
+              detail: evt.detail ?? b.tool.detail, kind: evt.kind ?? b.tool.kind } }
+            : b),
+        };
+      }
       const tool: ToolEntry = {
         id: evt.itemId,
         title: evt.title,
@@ -227,6 +255,23 @@ export function markIdleTimeout(state: RunState, seconds: number): RunState {
     terminal: 'idle_timeout',
     footer: null,
     idleTimeoutSeconds: seconds,
+  };
+}
+
+/**
+ * 这一轮没结束，只是上游长时间没数据被看门狗判死了 —— 渲染成「重试中」而不是终态：
+ * 已经流出来的内容留在卡上，terminal 回到 running，footer 转成 retrying。
+ */
+export function markRetrying(state: RunState, retry: RetryState, footer: FooterStatus = 'retrying'): RunState {
+  return {
+    ...state,
+    blocks: closeStreamingText(state.blocks),
+    reasoningActive: false,
+    terminal: 'running',
+    footer,
+    errorMsg: undefined,
+    idleTimeoutSeconds: undefined,
+    retry,
   };
 }
 

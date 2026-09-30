@@ -21,9 +21,8 @@ import { log } from '../core/logger';
  * (message-resource/get); the standalone `im.v1.image.get` (what the SDK's
  * `channel.downloadResource` uses) is limited to images the BOT itself
  * uploaded. Per Feishu, message-resource/get needs the bot to share the
- * resource's chat and "暂不支持获取合并转发消息中的子消息的资源文件" — so forwarded
- * sub-message images are attempted best-effort and skipped (logged, not
- * thrown) when Feishu rejects them.
+ * resource's chat. For merge_forward images, the key comes from a child item,
+ * but the resource endpoint must receive the outer merge_forward message ID.
  */
 
 /** Cap per message so a flood of images can't wedge a turn or fill the disk. */
@@ -33,8 +32,8 @@ const MAX_IMAGES = 9;
 const MEDIA_TTL_MS = 60 * 60_000;
 
 interface ImageRef {
-  /** the message that DIRECTLY holds the resource — `msg.messageId` for a plain
-   * image, the sub-message id for a forwarded one. */
+  /** Message ID to pass to message-resource/get. For a forwarded image this is
+   * the outer merge_forward ID, while fileKey is extracted from its child. */
   messageId: string;
   /** Feishu image_key (img_v3_…). */
   fileKey: string;
@@ -112,12 +111,7 @@ async function gatherRefs(channel: LarkChannel, msg: NormalizedMessage): Promise
     // `im.v1.message.get` on a merge_forward returns a FLAT list: the parent
     // first, then every descendant (the same shape the SDK's converter walks).
     const items = await fetchSubMessages(channel, msg.messageId);
-    for (const sub of items) {
-      if (!sub.message_id || sub.message_id === msg.messageId) continue;
-      for (const key of imageKeysFromContent(sub.msg_type, sub.body?.content)) {
-        add(sub.message_id, key);
-      }
-    }
+    for (const ref of forwardedImageRefs(msg.messageId, items)) add(ref.messageId, ref.fileKey);
   }
 
   return refs;
@@ -127,6 +121,19 @@ interface SubMessageItem {
   message_id?: string;
   msg_type?: string;
   body?: { content?: string };
+}
+
+/** Forwarded content exposes image keys on child items, but Feishu serves
+ * those keys through the outer merge_forward message resource endpoint. */
+export function forwardedImageRefs(parentMessageId: string, items: SubMessageItem[]): ImageRef[] {
+  const refs: ImageRef[] = [];
+  for (const sub of items) {
+    if (!sub.message_id || sub.message_id === parentMessageId) continue;
+    for (const fileKey of imageKeysFromContent(sub.msg_type, sub.body?.content)) {
+      refs.push({ messageId: parentMessageId, fileKey });
+    }
+  }
+  return refs;
 }
 
 async function fetchSubMessages(channel: LarkChannel, messageId: string): Promise<SubMessageItem[]> {
@@ -182,9 +189,11 @@ async function downloadOne(channel: LarkChannel, ref: ImageRef, index: number): 
     await res.writeFile(file);
     return file;
   } catch (err) {
-    // Forwarded sub-message images land here (Feishu rejects message-resource
-    // for merge_forward children) — info, not error: the turn still proceeds.
-    log.warn('intake', 'image-download-failed', { fileKey: ref.fileKey.slice(0, 24), err: String(err) });
+    log.warn('intake', 'image-download-failed', {
+      messageId: ref.messageId,
+      fileKey: ref.fileKey.slice(0, 24),
+      err: String(err),
+    });
     return undefined;
   }
 }

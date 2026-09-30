@@ -1,13 +1,15 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { AppServerClient } from '../src/agent/codex-appserver/app-server-client';
 import { CodexAppServerBackend } from '../src/agent/codex-appserver/backend';
+import { shutdownResidentClients } from '../src/agent/codex-appserver/client-pool';
+import { resolveCodexBin } from '../src/agent/codex-appserver/locate';
+import { writeNodeExecutable } from './helpers/node-executable';
 
 // 一个最小的假 codex app-server：应答 initialize / thread/start，收到 turn/start
-// 即自杀且不回包（模拟 app-server 中途崩溃）。POSIX shebang 脚本——Windows 上
-// 跑不了这种 fixture，整组跳过（被测代码本身是平台无关的状态机）。
+// 即自杀且不回包（模拟 app-server 中途崩溃），在所有平台运行真实子进程。
 const FAKE_SERVER = `#!/usr/bin/env node
 const fs = require('fs');
 let buf = '';
@@ -48,14 +50,14 @@ setInterval(() => {}, 1 << 30); // stay alive until killed
 `;
 
 const dir = mkdtempSync(join(tmpdir(), 'app-server-liveness-'));
-const bin = join(dir, 'codex');
-writeFileSync(bin, FAKE_SERVER, { mode: 0o755 });
+const { bin } = writeNodeExecutable(dir, 'codex', FAKE_SERVER);
 
-afterAll(() => {
+afterAll(async () => {
+  await shutdownResidentClients();
   rmSync(dir, { recursive: true, force: true });
 });
 
-describe.skipIf(process.platform === 'win32')('app-server 进程死亡自愈（QW-6）', () => {
+describe('app-server 进程死亡自愈（QW-6）', () => {
   it('exited flips on child death; pending request rejects, later requests fail fast', async () => {
     const client = new AppServerClient({ bin, cwd: dir });
     await client.connect();
@@ -120,11 +122,13 @@ describe.skipIf(process.platform === 'win32')('app-server 进程死亡自愈（Q
 
   it('retries a transient initialize timeout/error with a fresh app-server', async () => {
     const retryDir = mkdtempSync(join(tmpdir(), 'app-server-connect-retry-'));
-    const retryBin = join(retryDir, 'codex');
-    writeFileSync(retryBin, FAKE_SERVER, { mode: 0o755 });
+    const { bin: retryBin } = writeNodeExecutable(retryDir, 'codex', FAKE_SERVER);
     const previous = process.env.CODEX_BIN;
     process.env.CODEX_BIN = retryBin;
     try {
+      // 前面的用例已经把 dir/codex 缓存在 locate 模块里。此处要明确切到
+      // retryBin，才会真的覆盖 initialize 失败后重试的路径。
+      expect(resolveCodexBin({ force: true })).toBe(retryBin);
       const backend = new CodexAppServerBackend();
       const thread = await backend.startThread({ cwd: retryDir });
       expect(thread.sessionId).toBe('th_test');
