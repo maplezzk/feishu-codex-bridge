@@ -44,3 +44,7 @@
 通过 verification-evidence 发布：create → insert_image → insert_image → fetch。回读确认标题、passed 状态、2 个步骤、2 张图片与图片顺序。发布预检发现截图实际为 JPEG，修正文件扩展名后通过内容校验，没有绕过预检。
 
 Pi 测试进程均已关闭，临时工作目录移入废纸篓。原生测试会话历史保留供核对；本地证据 HTTP 服务和浏览器临时页已关闭。未修改凭据、Pi 配置、全局扩展、生产群或业务服务。
+
+## CI 补验
+
+首次 GitHub CI 的 Ubuntu/macOS 全部通过，Windows 三个 Node 版本均在同一历史测试断言失败：测试输入用 /tmp 根路径，join 的预期没有盘符，而实际绝对路径正确包含 D:。已将 fixture.cwd 规范成绝对路径，再保留同一业务断言；没有修改运行代码、跳过用例或放宽判断。失败记录：[run 36707822078](https://github.com/maplezzk/feishu-codex-bridge/actions/runs/36707822078)。补验终态以 PR #10 最新 head 的九项检查为准；原有真实 E2E 的适配器源码指纹保持一致，复用已发布证据。

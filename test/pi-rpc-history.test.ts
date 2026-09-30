@@ -1,10 +1,10 @@
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { findPiSession, listPiSessions, readPiHistory, sessionDirectory } from '../src/agent/pi-rpc/history';
 
-const cwd = '/tmp/pi-bridge-history-project';
+const cwd = resolve('/tmp/pi-bridge-history-project');
 const sessionId = '019f0000-0000-7000-8000-000000000001';
 const otherSessionId = '019f0000-0000-7000-8000-000000000002';
 
