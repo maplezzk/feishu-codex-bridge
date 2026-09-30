@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -121,8 +121,7 @@ describe('app-server 进程死亡自愈（QW-6）', () => {
 
   it('retries a transient initialize timeout/error with a fresh app-server', async () => {
     const retryDir = mkdtempSync(join(tmpdir(), 'app-server-connect-retry-'));
-    const retryBin = join(retryDir, 'codex');
-    writeFileSync(retryBin, FAKE_SERVER, { mode: 0o755 });
+    const { bin: retryBin } = writeNodeExecutable(retryDir, 'codex', FAKE_SERVER);
     const previous = process.env.CODEX_BIN;
     process.env.CODEX_BIN = retryBin;
     try {
