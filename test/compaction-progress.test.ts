@@ -182,11 +182,13 @@ describe('compaction progress through the real app-server transport', () => {
     try {
       await withThread(async thread => {
         const run = thread.runStreamed({ text: 'noise' });
-        const timeout = vi.fn(() => { void thread.abort(run.turnId()!); });
+        let aborted: Promise<void> | undefined;
+        const timeout = vi.fn(() => { aborted = thread.abort(run.turnId()!); });
         const events: AgentEvent[] = [];
         for await (const event of withIdleTimeout(run.events, 150, timeout, undefined, run.lastActivity)) {
           events.push(event);
         }
+        await aborted;
         expect(timeout).toHaveBeenCalledOnce();
         expect(events.some(e => e.type === 'context_compacting')).toBe(false);
         expect(JSON.stringify(warnings.mock.calls)).not.toContain('PRIVATE_MODEL_BODY');
