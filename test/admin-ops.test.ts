@@ -11,6 +11,7 @@ import {
   performSetCompletionReminder,
   performSetNoMention,
   performSetPermissionMode,
+  validateModelDefault,
   probeBackends as opsProbeBackends,
   runAdminWriteOp,
   validateBackendSwitch as opsValidateBackendSwitch,
@@ -397,6 +398,21 @@ describe('createAdminWriteExecutor / runAdminWriteOp（Web · IPC 入口）', ()
     const r = await runAdminWriteOp({ kind: 'setNoMention', project: 'demo', on: false }, deps);
     expect(r.ok).toBe(true);
     expect((await getProjectByName('demo'))?.noMention).toBe(false);
+  });
+
+  it('模型设置按项目后端列表校验，隐藏模型和不支持的强度不能写入', async () => {
+    const models = [
+      { id: 'gpt-6.1-sol', displayName: 'GPT-6.1 Sol', description: '', supportedEfforts: ['low', 'high'], defaultEffort: 'low', isDefault: true, hidden: false },
+      { id: 'hidden', displayName: 'Hidden', description: '', supportedEfforts: ['low'], defaultEffort: 'low', isDefault: false, hidden: true },
+    ] as const;
+    const backendFor = () => fakeBackend({ listModels: async () => models as unknown as Awaited<ReturnType<AgentBackend['listModels']>> });
+    expect(validateModelDefault(models as unknown as Awaited<ReturnType<AgentBackend['listModels']>>, 'hidden').ok).toBe(false);
+    const invalid = await runAdminWriteOp({ kind: 'setModelDefault', project: 'demo', model: 'gpt-6.1-sol', effort: 'ultra' }, { ...deps, backendFor });
+    expect(invalid.ok).toBe(false);
+    expect((await getProjectByName('demo'))?.defaultModel).toBeUndefined();
+    const saved = await runAdminWriteOp({ kind: 'setModelDefault', project: 'demo', model: 'gpt-6.1-sol', effort: 'high' }, { ...deps, backendFor });
+    expect(saved.ok).toBe(true);
+    expect(await getProjectByName('demo')).toMatchObject({ defaultModel: 'gpt-6.1-sol', defaultEffort: 'high' });
   });
 
   it('执行器：成功静默返回，拒绝抛 AdminWriteError（带 code，IPC/HTTP 可还原）', async () => {

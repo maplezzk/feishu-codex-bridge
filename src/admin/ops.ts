@@ -1,6 +1,6 @@
 import { backendIds } from '../agent';
 import { catalogById } from '../agent/catalog';
-import type { AgentBackend, BackendProbe, PermissionMode, ReasoningEffort } from '../agent/types';
+import type { AgentBackend, BackendProbe, ModelInfo, PermissionMode, ReasoningEffort } from '../agent/types';
 import { tierLabel, type BackendProbeRow } from '../card/dm-cards';
 import {
   COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES,
@@ -48,6 +48,7 @@ export type AdminWriteOp =
     }
   | { kind: 'setNoMention'; project: string; on: boolean }
   | { kind: 'setAutoCompact'; project: string; on: boolean }
+  | { kind: 'setModelDefault'; project: string; model: string; effort?: ReasoningEffort }
   | {
       kind: 'setCompletionReminder';
       mode: CompletionReminderMode;
@@ -301,6 +302,19 @@ export async function performSetModelDefault(opts: {
   return { ok: true, project: await freshOr(opts.projectName, { ...p, defaultModel: opts.model, defaultEffort: opts.effort }) };
 }
 
+/** Web 写入按项目后端的模型列表严格校验；非法强度直接拒绝并提示用户。 */
+export function validateModelDefault(models: ModelInfo[], modelId: string, effort?: string):
+  | { ok: true; model: string; effort?: ReasoningEffort }
+  | { ok: false; reason: string } {
+  const model = models.find((m) => m.id === modelId && !m.hidden);
+  if (!model) return { ok: false, reason: `模型「${modelId}」不在当前后端的可选列表中，请刷新后重试` };
+  const supported = model.supportedEfforts ?? [];
+  if (effort !== undefined && !supported.includes(effort as ReasoningEffort)) {
+    return { ok: false, reason: `模型「${modelId}」不支持推理强度「${effort}」` };
+  }
+  return { ok: true, model: model.id, effort: supported.length ? (effort as ReasoningEffort | undefined) ?? model.defaultEffort : undefined };
+}
+
 /**
  * 🔔 设置普通任务结束提醒。该偏好属于每个 bot 的 config.json，而非项目注册表：
  * 必须在持有 LIVE `cfg` 的 bot 进程内执行，先原子落盘，再替换同一个 cfg 对象的
@@ -400,6 +414,14 @@ export async function runAdminWriteOp(
         on: op.on,
         evictLiveSessionsForChat: deps.evictLiveSessionsForChat,
       });
+    case 'setModelDefault': {
+      const project = await getProjectByName(op.project);
+      if (!project) return { ok: false, reason: `项目「${op.project}」不存在` };
+      const models = await deps.backendFor(project.backend).listModels();
+      const checked = validateModelDefault(models, op.model, op.effort);
+      if (!checked.ok) return checked;
+      return performSetModelDefault({ projectName: op.project, model: checked.model, effort: checked.effort });
+    }
     case 'setCompletionReminder':
       if (!deps.cfg) return { ok: false, reason: 'bot 运行配置不可用，无法即时更新完成提醒' };
       return performSetCompletionReminder({
