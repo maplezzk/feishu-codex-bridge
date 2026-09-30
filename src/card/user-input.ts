@@ -53,6 +53,37 @@ export interface UserInputService {
   open(request: AgentUserInputRequest, scope: UserInputScope): Promise<void>;
   register(dispatcher: CardDispatcher): void;
   closeThread(threadId: string, reason: string): Promise<void>;
+  closeAll(reason: string): Promise<void>;
+}
+
+/** Async input has no outstanding RPC: deliver its answer as a new user input. */
+export function createAsyncUserInputRequest(
+  event: { threadId: string; turnId: string; itemId: string; questions: AgentUserInputQuestion[] },
+  submit: (text: string) => Promise<void>,
+): AgentUserInputRequest {
+  let pending = true;
+  const listeners = new Set<(reason: string) => void>();
+  function finish(reason: string): void {
+    if (!pending) throw new Error('user input request is no longer pending');
+    pending = false;
+    for (const listener of listeners) listener(reason);
+    listeners.clear();
+  }
+  return {
+    ...event, requestId: event.itemId, persistsAfterTurn: true,
+    isPending: () => pending,
+    respond: async (answers) => {
+      finish('responded');
+      const text = event.questions.map((q) => `${q.question}\n回答：${answers[q.id]!.answers.join('、')}`).join('\n\n');
+      await submit(`用户已回答你的提问：\n\n${text}`);
+    },
+    reject: async (reason) => { finish(reason); },
+    onResolved: (listener) => {
+      if (!pending) { listener('resolved'); return () => undefined; }
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+  };
 }
 
 /** The normal upper bound for a remote question wait. */
@@ -769,7 +800,8 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
   }
 
   async function closeThread(threadId: string, reason: string): Promise<void> {
-    const closing = [...active.values()].filter((state) => state.request.threadId === threadId);
+    const closing = [...active.values()].filter((state) => state.request.threadId === threadId &&
+      !(reason === 'run-ended' && state.request.persistsAfterTurn));
     await Promise.all(closing.map(async (state) => {
       if (state.phase === 'terminal') return;
       const resolvedReason = reasonText(reason, 'thread closed');
@@ -779,5 +811,10 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
     }));
   }
 
-  return { open, register, closeThread };
+  async function closeAll(reason: string): Promise<void> {
+    await Promise.all([...new Set([...active.values()].map((state) => state.request.threadId))]
+      .map((threadId) => closeThread(threadId, reason)));
+  }
+
+  return { open, register, closeThread, closeAll };
 }

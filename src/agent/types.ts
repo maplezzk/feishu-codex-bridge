@@ -127,6 +127,8 @@ export interface AgentUserInputRequest {
   itemId: string;
   questions: AgentUserInputQuestion[];
   autoResolutionMs?: number | null;
+  /** Async questions remain answerable after the producing turn finishes. */
+  persistsAfterTurn?: boolean;
   isPending(): boolean;
   respond(answers: Record<string, { answers: string[] }>): Promise<void>;
   reject(reason: string): Promise<void>;
@@ -149,6 +151,7 @@ export type AgentEvent =
   | { type: 'system'; threadId: string }
   | { type: 'turn_started'; turnId: string }
   | { type: 'user_input_request'; request: AgentUserInputRequest }
+  | { type: 'user_input_async'; threadId: string; turnId: string; itemId: string; questions: AgentUserInputQuestion[] }
   | { type: 'text_delta'; itemId: string; delta: string }
   | { type: 'text'; itemId: string; text: string }
   | { type: 'thinking_delta'; itemId: string; delta: string }

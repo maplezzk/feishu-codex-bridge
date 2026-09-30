@@ -20,7 +20,7 @@ import type {
   TurnOptions,
 } from '../types';
 import { isGoalTerminal } from '../types';
-import { BRIDGE_DEVELOPER_INSTRUCTIONS } from '../bridge-instructions';
+import { CODEX_BRIDGE_DEVELOPER_INSTRUCTIONS } from '../bridge-instructions';
 import { AppServerClient } from './app-server-client';
 import type { AppServerStreamEvent } from './app-server-client';
 import { refillWarmPool, takeWarmClient, utilityRequest } from './client-pool';
@@ -852,7 +852,7 @@ export class CodexAppServerBackend implements AgentBackend {
             cwd: opts.cwd,
             approvalPolicy: APPROVAL_POLICY,
             ...sandbox,
-            developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
+            developerInstructions: CODEX_BRIDGE_DEVELOPER_INSTRUCTIONS,
             ...(opts.model ? { model: opts.model } : {}),
           }),
           THREAD_CONTROL_TIMEOUT_MS,
@@ -892,7 +892,7 @@ export class CodexAppServerBackend implements AgentBackend {
             cwd: opts.cwd,
             approvalPolicy: APPROVAL_POLICY,
             ...sandbox,
-            developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
+            developerInstructions: CODEX_BRIDGE_DEVELOPER_INSTRUCTIONS,
             ...(opts.model ? { model: opts.model } : {}),
             ...(provider ? { modelProvider: provider } : {}),
           }),

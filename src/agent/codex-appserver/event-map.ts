@@ -109,6 +109,28 @@ export function mapNotification(n: ServerNotification, ctx?: MapContext): AgentE
     case 'item/started':
       return mapItemStart(n.params.item, ctx);
     case 'item/completed':
+      if (n.params.item.type === 'agentMessage') {
+        // 0.159 reports request_user_input_async as an agentMessage with
+        // questions, rather than the synchronous server request.
+        const questions = (n.params.item as ThreadItem & { questions?: unknown }).questions;
+        if (questions != null) {
+          if (!Array.isArray(questions) || questions.length < 1 || questions.length > 3 || questions.some((q) =>
+            !q || typeof q.title !== 'string' || !q.title.trim() ||
+            (q.options != null && (!Array.isArray(q.options) || !q.options.length ||
+              q.options.some((option: unknown) => typeof option !== 'string' || !option.trim()))))) {
+            return { type: 'error', message: 'Codex 异步提问内容无效，未发送提问卡。', willRetry: false };
+          }
+          return {
+            type: 'user_input_async', threadId: n.params.threadId, turnId: n.params.turnId,
+            itemId: n.params.item.id,
+            questions: questions.map((q, index) => ({
+              id: String(index), header: `Q${index + 1}`, question: q.title,
+              isOther: true, isSecret: false,
+              options: q.options?.map((label: string) => ({ label, description: '' })) ?? null,
+            })),
+          };
+        }
+      }
       return mapItemComplete(n.params.item);
     case 'thread/tokenUsage/updated':
       // `last` (most recent turn), NOT `total` (cumulative session sum). `total`

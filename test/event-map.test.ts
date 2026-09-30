@@ -15,6 +15,28 @@ function itemCompleted(item: ThreadItem): ServerNotification {
 }
 
 describe('mapNotification', () => {
+  it('maps the async question envelope emitted by Codex 0.159, without inventing an RPC', () => {
+    expect(mapNotification(notification('item/completed', { threadId: 'thread-1', turnId: 'turn-1',
+      item: { type: 'agentMessage', id: 'async-question', text: '', questions: [
+        { title: '选择回复风格', options: ['简洁', '详细'] }, { title: '有什么补充？', options: null },
+      ] },
+    }))).toEqual({ type: 'user_input_async', threadId: 'thread-1', turnId: 'turn-1', itemId: 'async-question',
+      questions: [
+        { id: '0', header: 'Q1', question: '选择回复风格', isOther: true, isSecret: false,
+          options: [{ label: '简洁', description: '' }, { label: '详细', description: '' }] },
+        { id: '1', header: 'Q2', question: '有什么补充？', isOther: true, isSecret: false, options: null },
+      ],
+    });
+  });
+
+  it('rejects a malformed async question batch rather than silently dropping its questions', () => {
+    expect(mapNotification(notification('item/completed', { threadId: 'thread-1', turnId: 'turn-1',
+      item: { type: 'agentMessage', id: 'async-question', text: '', questions: [
+        { title: 'Valid', options: ['Yes'] }, { title: '', options: ['No'] },
+      ] },
+    }))).toMatchObject({ type: 'error', willRetry: false });
+  });
+
   it('maps thread and turn lifecycle notifications', () => {
     expect(mapNotification(notification('thread/started', { thread: { id: 'thread-1' } }))).toEqual({
       type: 'system',
