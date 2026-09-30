@@ -63,7 +63,13 @@ interface Pending {
 /** An app-server event plus the bridge-only user-input request event. */
 export type AppServerStreamEvent =
   | ServerNotification
+  | CompactionProgressNotification
   | { method: 'bridge/userInput'; params: AgentUserInputRequest };
+
+export interface CompactionProgressNotification {
+  method: 'bridge/contextCompacting';
+  params: { threadId: string; turnId: string };
+}
 
 interface PendingUserInput {
   key: string;
@@ -99,6 +105,11 @@ export interface AppServerClientOptions {
 export class AppServerClient {
   private child: ChildProcessWithoutNullStreams | null = null;
   private buf = '';
+  private stderrBuf = '';
+  private stderrScope: { threadId: string; turnId?: string } | undefined;
+  private droppingStderrLine = false;
+  private activityScope: { threadId: string; turnId?: string } | undefined;
+  private activityMethod: string | undefined;
   private nextId = 0;
   private readonly pending = new Map<number, Pending>();
   private readonly events = new AsyncQueue<AppServerStreamEvent>();
@@ -140,25 +151,20 @@ export class AppServerClient {
     // Launch via cross-spawn (platform/spawn) so a Windows `.cmd` codex shim
     // runs instead of throwing EINVAL (CVE-2024-27980). With stdio all-piped the
     // streams are non-null, so the cast to *WithoutNullStreams is sound.
+    const env = mergeProcessEnv(process.env, { ...this.opts.env, FEISHU_CODEX_BRIDGE: '1' });
+    // Codex 0.159 drops response.compaction.compacting before app-server can
+    // notify us. Enable only that parser's diagnostics, not request/body logs.
+    env.RUST_LOG = `${env.RUST_LOG || 'warn'},codex_api::sse::responses=debug`;
     const child = spawnProcess(this.opts.bin, ['app-server', '--listen', 'stdio://'], {
       cwd: this.opts.cwd,
-      env: mergeProcessEnv(process.env, { ...this.opts.env, FEISHU_CODEX_BRIDGE: '1' }),
+      env,
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as ChildProcessWithoutNullStreams;
     this.child = child;
     log.info('agent', 'spawn', { pid: child.pid ?? null, cwd: this.opts.cwd });
 
     child.stdout.on('data', (d: Buffer) => this.onStdout(d));
-    child.stderr.on('data', (d: Buffer) => {
-      const line = d.toString('utf8').trim();
-      if (!line) return;
-      const fault = protocolFaultIn(line);
-      if (fault && !this.protocolFaultReason) {
-        this.protocolFaultReason = fault;
-        log.warn('agent', 'protocol-fault', { pid: child.pid ?? null, reason: fault });
-      }
-      log.warn('agent', 'stderr', { line: line.slice(0, 200) });
-    });
+    child.stderr.on('data', (d: Buffer) => this.onStderr(d));
     child.on('exit', (code, signal) => {
       log.info('agent', 'exit', { pid: child.pid ?? null, code, signal });
       // Mark the client dead so later request()/notify() reject fast instead of
@@ -198,7 +204,14 @@ export class AppServerClient {
         reject(new Error(`RPC ${method} response timed out; delivery unknown`));
       }, timeoutMs);
       this.pending.set(id, {
-        resolve: value => { clearTimeout(timer); resolve(value as T); },
+        resolve: value => {
+          clearTimeout(timer);
+          if (method === 'turn/start' && isRecord(value) && isRecord(value.turn) &&
+              typeof value.turn.id === 'string' && this.activityScope) {
+            this.activityScope.turnId = value.turn.id;
+          }
+          resolve(value as T);
+        },
         reject: error => { clearTimeout(timer); reject(error); },
       });
       this.child!.stdin.write(payload, (err) => {
@@ -228,6 +241,7 @@ export class AppServerClient {
           const step = await source.next();
           if (step.done || ended) break;
           const event = step.value;
+          if (event.method === 'bridge/contextCompacting') continue;
           if (event.method !== 'bridge/userInput') return { value: event, done: false };
           if (event.params.isPending()) {
             void event.params.reject('User input unavailable in this operation').catch((err: unknown) => {
@@ -490,12 +504,20 @@ export class AppServerClient {
         return;
       }
       case 'turn/started':
+        if (notification.params.threadId === this.activityScope?.threadId &&
+            this.activityMethod !== 'turn/start') {
+          this.activityScope.turnId = notification.params.turn.id;
+        }
         this.resolveUserInputs(
           (request) => request.threadId === notification.params.threadId && request.turnId !== notification.params.turn.id,
           'turn-started',
         );
         return;
       case 'turn/completed':
+        if (notification.params.threadId === this.activityScope?.threadId &&
+            notification.params.turn.id === this.activityScope.turnId) {
+          this.activityScope.turnId = undefined;
+        }
         this.resolveUserInputs(
           (request) => request.threadId === notification.params.threadId && request.turnId === notification.params.turn.id,
           'turn-completed',
@@ -524,13 +546,106 @@ export class AppServerClient {
     if (!isRecord(rawParams)) return;
     const threadId = typeof rawParams.threadId === 'string' ? rawParams.threadId : undefined;
     const turnId = typeof rawParams.turnId === 'string' ? rawParams.turnId : undefined;
+    if (threadId && ['turn/start', 'thread/compact/start', 'thread/goal/set'].includes(method)) {
+      this.activityScope = { threadId };
+      this.activityMethod = method;
+    }
     if (method === 'turn/interrupt' && threadId && turnId) {
+      if (threadId === this.activityScope?.threadId && turnId === this.activityScope.turnId) {
+        this.activityScope.turnId = undefined;
+      }
       this.resolveUserInputs(
         (request) => request.threadId === threadId && request.turnId === turnId,
         'turn-interrupted',
       );
     } else if (method === 'thread/close' && threadId) {
       this.resolveUserInputs((request) => request.threadId === threadId, 'thread-closed');
+    }
+  }
+
+  private onStderr(data: Buffer): void {
+    let text = data.toString('utf8');
+    if (this.droppingStderrLine) {
+      const end = text.indexOf('\n');
+      if (end < 0) return;
+      this.droppingStderrLine = false;
+      text = text.slice(end + 1);
+    }
+    if (!this.stderrBuf) this.stderrScope = this.activityScope && { ...this.activityScope };
+    this.stderrBuf += text;
+    let end: number;
+    while ((end = this.stderrBuf.indexOf('\n')) >= 0) {
+      const line = this.stderrBuf.slice(0, end).replace(/\x1b\[[0-9;]*m/g, '').trim();
+      const lineScope = this.stderrScope;
+      this.stderrBuf = this.stderrBuf.slice(end + 1);
+      this.stderrScope = this.activityScope && { ...this.activityScope };
+      if (!line) continue;
+      let message = line;
+      let loggedThreadId: string | undefined;
+      let loggedTurnId: string | undefined;
+      let parserDiagnostic = /\b(?:DEBUG|TRACE)\b.*\bcodex_api::sse::responses\b/.test(line);
+      if (parserDiagnostic) {
+        for (const match of line.matchAll(/\bthread(?:\.id|_id)=(?:"([^"]+)"|([\w-]+))/g)) {
+          loggedThreadId = match[1] ?? match[2];
+        }
+        for (const match of line.matchAll(/\bturn(?:\.id|_id)=(?:"([^"]+)"|([\w-]+))/g)) {
+          loggedTurnId = match[1] ?? match[2];
+        }
+      }
+      if (line.startsWith('{')) {
+        try {
+          const entry = JSON.parse(line) as Record<string, unknown>;
+          parserDiagnostic = ['DEBUG', 'TRACE'].includes(String(entry.level)) &&
+            entry.target === 'codex_api::sse::responses';
+          if (parserDiagnostic && isRecord(entry.fields)) {
+            message = String(entry.fields.message ?? '');
+            const spans = [...(Array.isArray(entry.spans) ? entry.spans : []), entry.span];
+            for (const span of spans) {
+              if (!isRecord(span)) continue;
+              const threadId = span['thread.id'] ?? span.thread_id;
+              const turnId = span['turn.id'] ?? span.turn_id;
+              if (typeof threadId === 'string') loggedThreadId = threadId;
+              if (typeof turnId === 'string') loggedTurnId = turnId;
+            }
+          }
+        } catch { /* stderr can be plain text beginning with a brace */ }
+      }
+      if (parserDiagnostic) {
+        if (/unhandled responses event: "response\.compaction\.compacting"\s*$/.test(message) &&
+            this.activityScope?.turnId &&
+            lineScope?.threadId === this.activityScope.threadId &&
+            lineScope.turnId === this.activityScope.turnId &&
+            (!loggedThreadId || loggedThreadId === this.activityScope.threadId) &&
+            (!loggedTurnId || loggedTurnId === this.activityScope.turnId)) {
+          // Current Codex stderr omits spans. A dedicated session process's
+          // unscoped heartbeat counts as process activity, just like child
+          // notifications in the backend. Never carry a partial line into a
+          // different turn; scoped diagnostics also have to match their origin.
+          this.events.push({
+            method: 'bridge/contextCompacting',
+            params: { threadId: this.activityScope.threadId, turnId: this.activityScope.turnId },
+          });
+          log.info('agent', 'compaction-progress', {
+            threadId: this.activityScope.threadId, turnId: this.activityScope.turnId,
+            source: loggedThreadId || loggedTurnId ? 'scoped-diagnostic' : 'session-process-diagnostic',
+          });
+        }
+        // Do not copy debug diagnostics (which may contain model payloads)
+        // into the bridge log or use arbitrary stderr as a liveness signal.
+        continue;
+      }
+      const fault = protocolFaultIn(line);
+      if (fault && !this.protocolFaultReason) {
+        this.protocolFaultReason = fault;
+        log.warn('agent', 'protocol-fault', { pid: this.pid ?? null, reason: fault });
+      }
+      log.warn('agent', 'stderr', { line: line.slice(0, 200) });
+    }
+    // A malformed child must not retain an unlimited unterminated log line.
+    if (this.stderrBuf.length > 64 * 1024) {
+      log.warn('agent', 'stderr-line-too-large', { pid: this.pid ?? null, chars: this.stderrBuf.length });
+      this.stderrBuf = '';
+      this.droppingStderrLine = true;
     }
   }
 

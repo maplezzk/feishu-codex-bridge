@@ -1,4 +1,5 @@
 import type { AgentEvent } from '../types';
+import type { CompactionProgressNotification } from './app-server-client';
 import type { FileUpdateChange, ServerNotification, ThreadItem } from './protocol';
 
 /** Files named in a fileChange title before collapsing to `等 N 个文件`. */
@@ -96,8 +97,10 @@ export interface MapContext {
  * item/reasoning/textDelta; item/completed gives the final text for
  * reconciliation; commandExecution/fileChange map to tool blocks.
  */
-export function mapNotification(n: ServerNotification, ctx?: MapContext): AgentEvent | null {
+export function mapNotification(n: ServerNotification | CompactionProgressNotification, ctx?: MapContext): AgentEvent | null {
   switch (n.method) {
+    case 'bridge/contextCompacting':
+      return { type: 'context_compacting' };
     case 'thread/started':
       return { type: 'system', threadId: n.params.thread.id };
     case 'turn/started':
@@ -168,6 +171,8 @@ export function mapNotification(n: ServerNotification, ctx?: MapContext): AgentE
 
 function mapItemStart(item: ThreadItem, ctx?: MapContext): AgentEvent | null {
   switch (item.type) {
+    case 'contextCompaction':
+      return { type: 'context_compacting' };
     case 'commandExecution':
       return { type: 'tool_use', itemId: item.id, title: item.command, detail: String(item.cwd), kind: 'command' };
     case 'fileChange':
@@ -204,6 +209,8 @@ function mapItemStart(item: ThreadItem, ctx?: MapContext): AgentEvent | null {
 
 function mapItemComplete(item: ThreadItem): AgentEvent | null {
   switch (item.type) {
+    case 'contextCompaction':
+      return { type: 'context_compacted' };
     case 'agentMessage':
       return { type: 'text', itemId: item.id, text: item.text };
     case 'reasoning': {

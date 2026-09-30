@@ -450,6 +450,7 @@ const FOOTER_STATUS: Record<Exclude<FooterStatus, null>, { readonly icon: string
   tool_running: { icon: 'setting-inter_outlined', text: '正在调用工具' },
   retrying: { icon: 'warning_outlined', text: '瞬断，自动重试中…' },
   streaming: { icon: 'edit_outlined', text: '正在输出' },
+  compacting: { icon: 'time_outlined', text: '正在压缩上下文，完成后继续处理' },
 };
 
 function footerStatus(status: Exclude<FooterStatus, null>): CardElement {
