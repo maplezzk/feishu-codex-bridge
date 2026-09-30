@@ -256,7 +256,7 @@ import {
   syncAllCommentInstructions,
   syncCommentInstructions,
 } from './comments';
-import { createGracefulInterrupt, Semaphore, withIdleTimeout } from './watchdog';
+import { createGracefulInterrupt, IdleTimeoutSetting, Semaphore, withIdleTimeout } from './watchdog';
 import { decideAutoRetry } from './auto-retry';
 
 /**
@@ -813,14 +813,21 @@ export function createOrchestrator(
     runTasks.add(task);
     try { await task; } finally { runTasks.delete(task); }
   }
-  // Read live per run (not frozen at startup) so the settings card's change to
-  // the idle timeout applies immediately to every group/thread — no daemon
-  // restart. `cfg` is the same object `applyPref` mutates, so this sees edits.
+  // Wake current turns only after the new preference has been persisted.
   const currentIdleMs = (): number => getRunIdleTimeoutMs(cfg) ?? 0;
+  const idleTimeout = new IdleTimeoutSetting(currentIdleMs());
+  let watchdogDisableVersion = 0;
   // One queue for every DM/Web mutation of this bot's preferences. Each write
   // reads the latest committed LIVE snapshot, persists its own next snapshot,
   // then commits it to LIVE — concurrent clicks cannot erase one another.
-  const writePreferences = createAppPreferencesWriter({ cfg });
+  const persistPreferences = createAppPreferencesWriter({ cfg });
+  const writePreferences: typeof persistPreferences = async (mutate) => {
+    const preferences = await persistPreferences(mutate);
+    const milliseconds = getRunIdleTimeoutMs({ ...cfg, preferences }) ?? 0;
+    if (milliseconds === 0 && idleTimeout.milliseconds > 0) watchdogDisableVersion++;
+    idleTimeout.update(milliseconds);
+    return preferences;
+  };
   const voice = createVoiceService(cfg, writePreferences);
   const orderContext = createIntakeQueue();
   const orderTurns = createIntakeQueue();
@@ -3376,7 +3383,7 @@ export function createOrchestrator(
       void patch(evt, buildWatchdogCustomCard(cfg));
     })
     // 保存自定义秒数：钳到 [MIN, MAX]（0=关闭）后写入，确保存的值即为生效值；
-    // applyPref 落盘并 patch 回设置卡，currentIdleMs() 下一轮立即读到新值。
+    // 落盘后唤醒当前计时器，立即按新值重新计算。
     .on(DM.watchdogCustomSubmit, ({ evt, formValue }) => {
       const raw = String(formValue?.sec ?? '').trim();
       const n = Number(raw);
@@ -4420,6 +4427,7 @@ export function createOrchestrator(
       // 自动重试的跨轮状态：这是第几次重试、以及那张原地更新的「自动重试中」卡。
       let retryAttempt = 0;
       let retryCardMsgId: string | undefined;
+      let retryStillAllowed: (() => boolean) | undefined;
       for (;;) {
         const turnInput = currentTurn.input;
         state.requesterOpenId = currentTurn.requesterOpenId;
@@ -4438,6 +4446,9 @@ export function createOrchestrator(
         const rec =
           firstRec !== undefined ? (firstRec ?? undefined) : topicThreadId ? await getSession(topicThreadId) : undefined;
         firstRec = undefined;
+        // getSession/title refresh can await after a retry was prepared.
+        if (retryStillAllowed && !retryStillAllowed()) break;
+        retryStillAllowed = undefined;
         const turnModel = rec?.model ?? opts.model;
         const turnEffort = rec?.effort ?? opts.effort;
         const modelDisp = getModelDisplay(cfg);
@@ -4659,12 +4670,14 @@ export function createOrchestrator(
         disposeInterrupt = stopper.dispose;
         state.interrupt = () => { state.intakeCancelled = true; stopper.interrupt(); };
         if (stopRequestedDuringCardSetup) stopper.interrupt();
-        const idleMs = currentIdleMs();
+        const disableVersionAtStart = watchdogDisableVersion;
+        let timeoutMs = 0;
         const guarded = withIdleTimeout(
           run.events,
-          idleMs,
+          idleTimeout,
           () => {
             timedOut = true;
+            timeoutMs = idleTimeout.milliseconds;
           },
           stopSignal,
           run.lastActivity, // raw-notification liveness: a long shell command isn't "idle"
@@ -4759,7 +4772,7 @@ export function createOrchestrator(
         settleOrdinaryTurnRender(render, {
           interrupted,
           timedOut,
-          idleTimeoutSeconds: Math.round(idleMs / 1000),
+          idleTimeoutSeconds: Math.round(timeoutMs / 1000),
           procDead,
           protocolFault,
         });
@@ -4914,13 +4927,14 @@ export function createOrchestrator(
             protocolFault,
             attempt: retryAttempt + 1,
             canResume: true,
+            enabled: currentIdleMs() > 0 && disableVersionAtStart === watchdogDisableVersion,
           });
           if (!decision.retry) {
             log.info('agent', 'auto-retry-skip', {
               threadId: topicThreadId,
               reason: decision.reason,
               attempt: retryAttempt + 1,
-              idleSeconds: Math.round(idleMs / 1000),
+              idleSeconds: Math.round(timeoutMs / 1000),
               protocolFault: protocolFault ?? null,
             });
             if (decision.reason === 'exhausted') {
@@ -4936,7 +4950,7 @@ export function createOrchestrator(
             }
           } else {
             retryAttempt = decision.attempt;
-            const idleSeconds = Math.round(idleMs / 1000);
+            const idleSeconds = Math.round(timeoutMs / 1000);
             const retryView = (phase: 'waiting' | 'started' | 'stopped') =>
               buildRetryCard({
                 attempt: retryAttempt,
@@ -4954,86 +4968,101 @@ export function createOrchestrator(
               idleSeconds,
               reason: 'watchdog-timeout',
             });
-            try {
-              if (retryCardMsgId) {
-                await updateManagedCard(channel, retryCardMsgId, retryView('waiting'));
-              } else {
-                const sent = await sendManagedCard(channel, opts.chatId, retryView('waiting'), finalMsgId, !opts.flat);
-                retryCardMsgId = sent.messageId;
-              }
-            } catch (err) {
-              log.fail('card', err, { phase: 'auto-retry-card' });
-            }
-            // 等待退避：期间 ⏹ 走 RC.stop → runsByCard → state.interrupt，能立刻打断。
             let stopWaiting = false;
             let wakeWait: (() => void) | undefined;
-            const waitEnd = new Promise<void>((res) => {
-              wakeWait = res;
+            const cancelRetry = (): void => {
+              stopWaiting = true;
+              wakeWait?.();
+            };
+            const allowed = (): boolean => !stopWaiting && currentIdleMs() > 0 &&
+              disableVersionAtStart === watchdogDisableVersion;
+            const unsubscribeRetry = idleTimeout.subscribe(() => {
+              if (!allowed()) cancelRetry();
             });
-            const waitTimer = setTimeout(() => wakeWait?.(), decision.delayMs);
-            if (retryCardMsgId) {
-              runsByCard.set(retryCardMsgId, state);
-              state.interrupt = () => {
-                stopWaiting = true;
-                wakeWait?.();
-              };
-            }
-            await waitEnd;
-            clearTimeout(waitTimer);
-            state.interrupt = undefined;
-            if (retryCardMsgId) runsByCard.delete(retryCardMsgId);
-            if (stopWaiting) {
-              log.info('agent', 'auto-retry-stopped', {
-                threadId: topicThreadId,
-                attempt: retryAttempt,
-              });
-              if (retryCardMsgId) {
-                void updateManagedCard(channel, retryCardMsgId, retryView('stopped')).catch((err) =>
-                  log.fail('card', err, { phase: 'auto-retry-card-stopped' }),
-                );
+            state.interrupt = cancelRetry;
+            retryStillAllowed = allowed;
+            try {
+              try {
+                if (retryCardMsgId) {
+                  await updateManagedCard(channel, retryCardMsgId, retryView('waiting'));
+                } else {
+                  const sent = await sendManagedCard(channel, opts.chatId, retryView('waiting'), finalMsgId, !opts.flat);
+                  retryCardMsgId = sent.messageId;
+                }
+              } catch (err) {
+                log.fail('card', err, { phase: 'auto-retry-card' });
               }
-              // 落到下面的 recycle 收尾：丢掉排队消息并结束这一轮。
-            } else {
-              if (retryCardMsgId) {
-                void updateManagedCard(channel, retryCardMsgId, retryView('started')).catch((err) =>
-                  log.fail('card', err, { phase: 'auto-retry-card-started' }),
-                );
-              }
-              const retryProject = await getProjectByChatId(opts.chatId);
-              const retryPerm = turnPerm(
-                retryProject ?? undefined,
-                currentTurn.requesterOpenId ?? opts.requesterOpenId ?? '',
-              );
-              const { thread: resumed } = await resolveThread(topicThreadId, opts.chatId, {
-                mode: retryPerm.mode ?? opts.mode,
-                network: retryPerm.network,
-                autoCompact: retryPerm.autoCompact,
+              // 等待退避：期间 ⏹ 走 RC.stop → runsByCard → state.interrupt，能立刻打断。
+              const waitEnd = new Promise<void>((res) => {
+                wakeWait = res;
               });
-              if (!resumed) {
-                log.warn('agent', 'auto-retry-no-session', {
+              const waitTimer = setTimeout(() => wakeWait?.(), decision.delayMs);
+              if (retryCardMsgId) {
+                runsByCard.set(retryCardMsgId, state);
+              }
+              if (!allowed()) wakeWait?.();
+              await waitEnd;
+              clearTimeout(waitTimer);
+              if (!allowed()) {
+                log.info('agent', 'auto-retry-stopped', {
                   threadId: topicThreadId,
                   attempt: retryAttempt,
                 });
-                await channel
-                  .send(
-                    opts.chatId,
-                    {
-                      markdown: `⚠️ 第 ${retryAttempt} 次自动重试失败：这个会话恢复不出来（记录缺失或后端未起来）。会话记录没动，重发一条消息即可继续。`,
-                    },
-                    { replyTo: finalMsgId, replyInThread: !opts.flat },
-                  )
-                  .catch((err) => log.fail('card', err, { phase: 'auto-retry-no-session' }));
+                if (retryCardMsgId) {
+                  void updateManagedCard(channel, retryCardMsgId, retryView('stopped')).catch((err) =>
+                    log.fail('card', err, { phase: 'auto-retry-card-stopped' }),
+                  );
+                }
+                // 落到下面的 recycle 收尾：丢掉排队消息并结束这一轮。
               } else {
-                thread = resumed;
-                state.thread = resumed;
-                firstRec = undefined; // 重试不是首轮：model/effort 重读持久化记录
-                log.info('agent', 'auto-retry-resume', {
-                  threadId: topicThreadId,
-                  sessionId: resumed.sessionId,
-                  attempt: retryAttempt,
-                });
-                continue; // 同一轮输入整轮重发
+                if (retryCardMsgId) {
+                  void updateManagedCard(channel, retryCardMsgId, retryView('started')).catch((err) =>
+                    log.fail('card', err, { phase: 'auto-retry-card-started' }),
+                  );
+                }
+                const retryProject = await getProjectByChatId(opts.chatId);
+                const retryPerm = turnPerm(
+                  retryProject ?? undefined,
+                  currentTurn.requesterOpenId ?? opts.requesterOpenId ?? '',
+                );
+                const { thread: resumed } = allowed() ? await resolveThread(topicThreadId, opts.chatId, {
+                  mode: retryPerm.mode ?? opts.mode,
+                  network: retryPerm.network,
+                  autoCompact: retryPerm.autoCompact,
+                }) : { thread: undefined };
+                if (!allowed()) {
+                  if (retryCardMsgId) await updateManagedCard(channel, retryCardMsgId, retryView('stopped'))
+                    .catch((err) => log.fail('card', err, { phase: 'auto-retry-card-stopped' }));
+                } else if (!resumed) {
+                  log.warn('agent', 'auto-retry-no-session', {
+                    threadId: topicThreadId,
+                    attempt: retryAttempt,
+                  });
+                  await channel
+                    .send(
+                      opts.chatId,
+                      {
+                        markdown: `⚠️ 第 ${retryAttempt} 次自动重试失败：这个会话恢复不出来（记录缺失或后端未起来）。会话记录没动，重发一条消息即可继续。`,
+                      },
+                      { replyTo: finalMsgId, replyInThread: !opts.flat },
+                    )
+                    .catch((err) => log.fail('card', err, { phase: 'auto-retry-no-session' }));
+                } else {
+                  thread = resumed;
+                  state.thread = resumed;
+                  firstRec = undefined; // 重试不是首轮：model/effort 重读持久化记录
+                  log.info('agent', 'auto-retry-resume', {
+                    threadId: topicThreadId,
+                    sessionId: resumed.sessionId,
+                    attempt: retryAttempt,
+                  });
+                  continue; // 同一轮输入整轮重发
+                }
               }
+            } finally {
+              unsubscribeRetry();
+              state.interrupt = undefined;
+              if (retryCardMsgId) runsByCard.delete(retryCardMsgId);
             }
           }
         }
@@ -5616,7 +5645,7 @@ export function createOrchestrator(
 
             let state: RunState = initialState;
             let timedOut = false;
-            const guarded = withIdleTimeout(run.events, currentIdleMs(), () => {
+            const guarded = withIdleTimeout(run.events, idleTimeout, () => {
               timedOut = true;
             }, undefined, run.lastActivity);
             for await (const ev of guarded) {

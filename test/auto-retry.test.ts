@@ -37,6 +37,10 @@ describe('decideAutoRetry', () => {
     });
   });
 
+  it('does not retry after the watchdog was disabled', () => {
+    expect(decideAutoRetry({ ...base, enabled: false })).toEqual({ retry: false, reason: 'watchdog-disabled' });
+  });
+
   it('retries a dead child process too', () => {
     const d = decideAutoRetry({ ...base, timedOut: false, procDead: true });
     expect(d.retry).toBe(true);

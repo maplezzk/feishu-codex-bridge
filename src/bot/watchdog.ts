@@ -1,3 +1,22 @@
+/** One live setting shared by the current turns; updates wake their pending waits. */
+export class IdleTimeoutSetting {
+  private listeners = new Set<() => void>();
+  constructor(private value: number) {}
+
+  get milliseconds(): number { return this.value; }
+
+  update(milliseconds: number): void {
+    if (milliseconds === this.milliseconds) return;
+    this.value = milliseconds;
+    for (const listener of this.listeners) listener();
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
+}
+
 /**
  * Wrap an async iterable with a per-event idle timeout and an optional external
  * stop signal. If no event arrives within `idleMs`, calls `onTimeout()` and
@@ -15,12 +34,12 @@
  */
 export async function* withIdleTimeout<T>(
   source: AsyncIterable<T>,
-  idleMs: number,
+  timeout: number | IdleTimeoutSetting,
   onTimeout: () => void,
   stop?: Promise<unknown>,
   lastActivity?: () => number,
 ): AsyncGenerator<T> {
-  if ((!idleMs || idleMs <= 0) && !stop) {
+  if (typeof timeout === 'number' && timeout <= 0 && !stop) {
     yield* source;
     return;
   }
@@ -30,31 +49,45 @@ export async function* withIdleTimeout<T>(
   // queues a second next() behind the first, so racing a fresh one each lap
   // would silently drop the value the abandoned call eventually resolves with.
   let pendingNext: Promise<IteratorResult<T>> | undefined;
-  let timerMs = idleMs;
+  let lastValueAt = Date.now();
   while (true) {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let unsubscribe: (() => void) | undefined;
+    const idleMs = typeof timeout === 'number' ? timeout : timeout.milliseconds;
+    const activityAt = Math.max(lastValueAt, lastActivity?.() ?? lastValueAt);
+    const timerMs = Math.max(0, idleMs - (Date.now() - activityAt));
     pendingNext ??= iter.next();
-    const races: Promise<IteratorResult<T> | '__idle__' | '__stop__'>[] = [pendingNext];
+    const races: Promise<IteratorResult<T> | '__idle__' | '__stop__' | '__changed__'>[] = [pendingNext];
+    if (typeof timeout !== 'number') {
+      races.push(new Promise<'__changed__'>((res) => {
+        unsubscribe = timeout.subscribe(() => res('__changed__'));
+      }));
+    }
     if (idleMs && idleMs > 0) {
       races.push(new Promise<'__idle__'>((res) => {
         timer = setTimeout(() => res('__idle__'), timerMs);
       }));
     }
     if (stopRace) races.push(stopRace);
-    const raced = await Promise.race(races);
-    if (timer) clearTimeout(timer);
+    let raced: Awaited<(typeof races)[number]>;
+    try {
+      raced = await Promise.race(races);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      unsubscribe?.();
+    }
+    if (raced === '__changed__') continue;
     if (raced === '__idle__') {
-      const sinceActivity = lastActivity ? Date.now() - lastActivity() : Infinity;
-      if (sinceActivity < idleMs) {
-        timerMs = idleMs - sinceActivity; // real activity recently — re-arm for the remainder
-        continue;
-      }
+      // Re-read after the await: a setting change may race the old deadline.
+      const liveMs = typeof timeout === 'number' ? timeout : timeout.milliseconds;
+      const sinceActivity = Date.now() - Math.max(lastValueAt, lastActivity?.() ?? lastValueAt);
+      if (liveMs <= 0 || sinceActivity < liveMs) continue;
       onTimeout();
       return;
     }
     if (raced === '__stop__') return;
     pendingNext = undefined;
-    timerMs = idleMs;
+    lastValueAt = Date.now();
     const r = raced as IteratorResult<T>;
     if (r.done) return;
     yield r.value;
