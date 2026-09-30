@@ -13,6 +13,7 @@ describe('safeBackendId —— 飞书表单 backend 值的防伪收口', () => {
     expect(safeBackendId({ backend: 'codex-appserver' })).toBe('codex-appserver');
     expect(safeBackendId({ backend: ['codex-appserver'] })).toBe('codex-appserver');
     expect(safeBackendId({ backend: { value: 'codex-appserver' } })).toBe('codex-appserver');
+    expect(safeBackendId({ backend: 'pi-rpc' })).toBe('pi-rpc');
   });
 
   it('未选 / 空 → undefined（落回默认 codex）', () => {
@@ -37,6 +38,10 @@ describe('bindModeFor —— 绑定『已有群』按所选后端定档（外部
 
   it('未知 / 未注册 id → undefined（catalogById 查不到 ⇒ 不臆造档；落地时 assertBackendUsable 再兜底拒绝）', () => {
     expect(bindModeFor('no-such-backend')).toBeUndefined();
+  });
+
+  it('Pi 只支持 full → 绑定已有群时自动选择 full，不沿用外部群 qa 默认', () => {
+    expect(bindModeFor('pi-rpc')).toBe('full');
   });
 });
 

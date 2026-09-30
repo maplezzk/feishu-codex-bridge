@@ -2,14 +2,15 @@ import type { BackendProbe, PermissionMode } from './types';
 import { DEFAULT_BACKEND_ID } from './types';
 import { BACKEND_CATALOG, catalogById, type AgentFamily } from './catalog';
 import { resolveCodexBin, codexVersionAsync } from './codex-appserver/locate';
+import { PiRpcBackend } from './pi-rpc/backend';
 
 /**
- * 按 agent 维度检测（backend-detection.md §1）：探底层 agent（当前仅 codex）→ 推导
+ * 按 agent 维度检测（backend-detection.md §1）：探底层 agent → 推导
  * 每个后端的可用性，并据此算「有效默认后端」。后端只是 agent 的「接入方式」——本机
  * 能力面按 agent 组织，与运行时工厂表（REGISTRY）解耦，便于将来再挂新 agent。
  *
- * 智能默认：有 codex → codex-appserver；否则回退 codex-appserver 占位（doctor 会报
- * 需安装）。
+ * 智能默认仍只认 Codex：有 codex → codex-appserver；否则回退 codex-appserver 占位。
+ * Pi 只作为显式选择和项目 picker 的可用性信息，不改变历史默认路由。
  */
 
 export type AgentId = 'codex' | (string & {});
@@ -62,9 +63,39 @@ async function probeCodexAgent(): Promise<AgentRuntime> {
   };
 }
 
-/** 探全部 agent（当前仅 codex），并行。绝不抛错（各 probe 自身降级）。 */
+/** 探 Pi agent（doctor 由 Pi 后端统一实现）。单条失败要带出原因，不能伪装成未探测。 */
+async function probePiAgent(): Promise<AgentRuntime> {
+  const entry = BACKEND_CATALOG.find((e) => e.id === 'pi-rpc')!;
+  let probe: BackendProbe;
+  try {
+    probe = await new PiRpcBackend().doctor({ force: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    probe = { ok: false, version: null, hint: `pi 探测失败：${message}` };
+  }
+  const reason = probe.ok ? undefined : (probe.hint ?? entry.dep.detectHint);
+  return {
+    id: 'pi',
+    displayName: 'Pi',
+    installed: probe.ok,
+    version: probe.version,
+    installHint: probe.ok ? undefined : reason,
+    backends: [
+      {
+        backendId: 'pi-rpc',
+        available: probe.ok,
+        reason,
+        version: probe.version,
+        supportedModes: entry.supportedModes,
+        installable: probe.installable ?? false,
+      },
+    ],
+  };
+}
+
+/** 探全部 agent，并行。绝不抛错（各 probe 自身降级）。 */
 export async function detectAgents(): Promise<AgentRuntime[]> {
-  return Promise.all([probeCodexAgent()]);
+  return Promise.all([probeCodexAgent(), probePiAgent()]);
 }
 
 /** 从一次 detectAgents 结果挑默认后端（智能默认规则）。 */

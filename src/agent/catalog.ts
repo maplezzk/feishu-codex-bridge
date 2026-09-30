@@ -10,19 +10,19 @@ import { DEFAULT_BACKEND_ID, type PermissionMode } from './types';
  * catalog（设计 §3.5）。Web 后端页 / DM picker / doctor / 按需下载按钮全自动出现。
  */
 
-/** 底层 agent 家族（picker 按此分组；当前仅 Codex 组；string 为未来 agent 预留）。 */
-export type AgentFamily = 'codex' | 'claude' | (string & {});
+/** 底层 agent 家族（picker 按此分组；string 为未来 agent 预留）。 */
+export type AgentFamily = 'codex' | 'claude' | 'pi' | (string & {});
 
 /** 后端进程的接入方式（仅描述/分组用，不参与运行路由）。 */
-export type BackendAccess = 'app-server' | 'sdk' | 'acp';
+export type BackendAccess = 'app-server' | 'sdk' | 'acp' | 'rpc';
 
 /**
  * 依赖类型 —— 决定「装哪 / 怎么检测 / 能不能一键按需装」。
- *   'external-cli'  外部 CLI（codex / 未来 gemini-cli），bridge 不负责装，doctor 探 PATH。
+ *   'external-cli'  外部 CLI（codex / pi / 未来 gemini-cli），bridge 不负责装，doctor 探 PATH。
  *   'npm-ondemand'  npm 包，按需装到用户私装目录（库类 / bin 类两形态）。
  *                   **唯一可一键下载的类型。** 库类（无 binName）走 import + require.resolve；
  *                   bin 类（有 binName）被 spawn、走 node_modules/.bin 路径（见 backend-loader）。
- *                   当前内置后端均非此类（codex 是 external-cli），保留以备将来挂新后端。
+ *                   当前 Claude 后端使用此类；Codex / Pi 是用户自管的 external-cli。
  *   'npm-external'  外部 npm 包，用户自管（当前内置后端无此类，保留给未来不便按需装的包）。
  */
 export type DepKind = 'external-cli' | 'npm-ondemand' | 'npm-external';
@@ -32,12 +32,16 @@ export interface BackendDep {
   /** npm 包名（npm-ondemand / npm-external 时）。 */
   pkg?: string;
   /**
-   * 该包作为「被 spawn 的可执行文件」消费时的 bin 名（npm 装包生成 node_modules/.bin/<binName>）。
-   * 有此字段 ⇒ bin 类后端：已装判定/命令解析走 .bin 路径而非 require.resolve
+   * 该包作为「被 spawn 的可执行文件」消费时的 bin 名（npm 装包生成
+   * node_modules/.bin/<binName>，外部 CLI 也用它声明 PATH 查找名）。
+   * 有此字段 ⇒ bin 类后端：已装判定/命令解析走可执行文件路径而非 require.resolve
    *   （bin-only 包通常无 main 入口，resolve 必失败）。
-   * 无此字段 ⇒ 库类后端：走 import() + require.resolve。
+   * 无此字段 ⇒ 库类后端：走 import() + require.resolve；external-cli 无 binName 时仍由
+   * 自己的 doctor/locate 探测（Codex 兼容现有路径）。
    */
   binName?: string;
+  /** 外部 CLI 的环境变量覆盖名（例如 pi 的 PI_BIN）；不设置则不读环境覆盖。 */
+  envBinKey?: string;
   /** pin 版本（npm-ondemand，避免漂移）；undefined ⇒ latest。 */
   version?: string;
   /** 体积提示 MB（Web 下载确认用，给用户预期）。 */
@@ -114,6 +118,23 @@ export const BACKEND_CATALOG: readonly BackendCatalogEntry[] = [
     supportedModes: ['qa', 'write', 'full'],
     blurb: 'Claude Code（SDK 内置，复用本机登录；qa/write 走 OS 沙箱，能力较 Codex 精简）',
   },
+  {
+    id: 'pi-rpc',
+    agentFamily: 'pi',
+    displayName: 'Pi',
+    access: 'rpc',
+    dep: {
+      kind: 'external-cli',
+      pkg: '@earendil-works/pi-coding-agent',
+      binName: 'pi',
+      envBinKey: 'PI_BIN',
+      detectHint: '未找到 pi CLI（设 PI_BIN、装 @earendil-works/pi-coding-agent，或放到 PATH）',
+      installCmd: 'npm i -g @earendil-works/pi-coding-agent（或设 PI_BIN）',
+    },
+    // pi 没有内置项目沙箱，第一版只允许完全访问，拒绝静默提升 qa/write。
+    supportedModes: ['full'],
+    blurb: 'Pi Coding Agent（RPC；仅完全访问；不支持 goal）',
+  },
 ];
 
 /**
@@ -143,7 +164,7 @@ export function catalogBackendIds(): string[] {
 /**
  * 新建项目时「可选后端」（飞书新建/绑定卡的后端下拉数据源）。规则（产品定）：
  *   ① codex（DEFAULT_BACKEND_ID）始终可选 —— 它是 external-cli 基线（全局 codex / Codex.app），
- *      isBackendEntryInstalled 对 external-cli 恒 false，但作为默认后端必须始终能选；
+ *      不依赖 isBackendEntryInstalled 的结果，作为默认后端必须始终能选；
  *   ② 其余后端「已下载」才列（isInstalled 注入，本模块不碰文件系统、便于单测）；
  *   ③ 再按项目权限档过滤：后端 supportedModes 不含该档则剔除（仅支持部分档的后端，
  *      在不支持的档下自然不出现）。

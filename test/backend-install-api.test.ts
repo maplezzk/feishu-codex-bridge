@@ -6,8 +6,8 @@ import type { BackendProbe } from '../src/agent/types';
 // 避免真机探测（codex 是否装会让断言飘）。installBackendDep 这里不用（service 走
 // 注入的 deps.installBackend），但 index 仍需导出它（service import 了）。
 //
-// 现实只有 codex-appserver 一个真实后端（external-cli，非 installable）。为保住「安装
-// API 通用机制」（版本 pin 拼包名、库类/ bin 类 binName 透传、501 预览态）的覆盖，本
+// 本文件 mock 的受控 catalog 只放 codex-appserver（external-cli，非 installable）。为保住
+// 「安装 API 通用机制」（版本 pin 拼包名、库类/ bin 类 binName 透传、501 预览态）的覆盖，
 // mock 额外塞两条**纯合成的假后端**（fake-lib / fake-bin，npm-ondemand），走 installable
 // 分支验证委托逻辑——它们不对应任何真实后端，只是 catalog 派生机制的最小夹具。
 
