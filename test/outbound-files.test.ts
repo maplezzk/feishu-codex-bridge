@@ -120,7 +120,7 @@ describe('click-to-get local files', () => {
     expect(send.mock.calls.at(-1)![1].markdown).toContain('入口已失效');
   });
 
-  it('replaces file references at their original positions without a footer or duplicate labels', async () => {
+  it('keeps complete prose and places clickable files below the containing paragraph', async () => {
     await writeFile(join(cwd, 'second.txt'), 'second file');
     const raw = '介绍段落。\n\n- [报告](<测试 报告.xlsx>)：查看报告。\n- `second.txt`：查看文本。\n\n结束段落。';
     const localFiles = await service.prepare(raw, context);
@@ -130,9 +130,10 @@ describe('click-to-get local files', () => {
     expect(result).not.toContain('grey-50');
     expect(result).not.toContain('获取并查看');
     expect(result.match(/<font color='blue'>报告<\/font>/g)).toHaveLength(1);
-    const ordered = ['介绍段落', "<font color='blue'>报告", '：查看报告', "<font color='blue'>second.txt", '：查看文本', '结束段落'];
+    const ordered = ['介绍段落', '：查看报告', '：查看文本', "<font color='blue'>报告", "<font color='blue'>second.txt", '结束段落'];
     expect(ordered.map((label) => result.indexOf(label))).toEqual(ordered.map((label) => result.indexOf(label)).sort((a, b) => a - b));
     expect(values(buildRunCard(rc))).toHaveLength(2);
+    expect(localFiles.links.every(({ element }) => element.width === 'fill')).toBe(true);
   });
 
   it('updates every inline alias after sending and after a restart, without sending twice', async () => {

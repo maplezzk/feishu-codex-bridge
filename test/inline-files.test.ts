@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { renderFileAnswer, type InlineFiles } from '../src/card/inline-files';
 
-const files = (text: string): InlineFiles => ({ text, links: [{ token: 'FILETOKEN', element: {
+const files = (text: string): InlineFiles => ({ text, links: [{ token: 'FILETOKEN', fallback: '`报告.txt`', element: {
   tag: 'interactive_container', element_id: 'local_file_0',
   elements: [{ tag: 'markdown', content: "<font color='blue'>报告.txt</font>" }],
 } }] });
@@ -16,8 +16,30 @@ function contents(value: unknown): string[] {
 describe('inline file layout', () => {
   it('preserves paragraph order and ordered list numbers without visible emphasis markers', () => {
     const result = renderFileAnswer(files('开头。\n\n3. **下载 FILETOKEN 查看**\n\n结束。'));
-    expect(contents(result).map((text) => text.trim())).toEqual(['开头。', '3\\. **下载**&nbsp;', "<font color='blue'>报告.txt</font>", '&nbsp;**查看**', '结束。']);
+    expect(contents(result).map((text) => text.trim())).toEqual(['开头。', '3. **下载 `报告.txt` 查看**', "<font color='blue'>报告.txt</font>", '结束。']);
     expect(JSON.stringify(result)).not.toContain('FILETOKEN');
+  });
+
+  it('keeps long Chinese prose in one paragraph with a full-width file below', () => {
+    const prepared = files('可以，脚本已经做好并合并，以后我会直接运行 FILETOKEN，不再逐仓手工整理。它会生成原模板 Excel 和文字版，填写飞书产能表。');
+    const result = renderFileAnswer(prepared);
+    expect(result).toEqual([
+      { tag: 'markdown', content: '可以，脚本已经做好并合并，以后我会直接运行 `报告.txt`，不再逐仓手工整理。它会生成原模板 Excel 和文字版，填写飞书产能表。' },
+      prepared.links[0]!.element,
+    ]);
+    expect(JSON.stringify(result)).not.toContain('column_set');
+  });
+
+  it('keeps multi-line lists and multiple file controls in source order', () => {
+    const prepared = files('# 文件\n\n- FILETOKEN：查看报告。\n- SECOND：查看文本。\n\n结束。');
+    const second = { tag: 'interactive_container', element_id: 'local_file_1', elements: [] };
+    prepared.links.push({ token: 'SECOND', fallback: '`second.txt`', element: second });
+    expect(renderFileAnswer(prepared)).toEqual([
+      { tag: 'markdown', content: '# 文件' },
+      { tag: 'markdown', content: '- `报告.txt`：查看报告。\n- `second.txt`：查看文本。' },
+      prepared.links[0]!.element, second,
+      { tag: 'markdown', content: '结束。' },
+    ]);
   });
 
   it('handles a file that is the entire bold link without emitting empty text or extra buttons', () => {

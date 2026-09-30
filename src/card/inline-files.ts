@@ -7,7 +7,7 @@ import { hasMarkdownTable, renderReport } from './report-render';
  * aliases of a file share the same delivery record. */
 export interface InlineFiles {
   text: string;
-  links: Array<{ token: string; element: CardElement }>;
+  links: Array<{ token: string; fallback: string; element: CardElement }>;
 }
 
 export function renderFileAnswer(files: InlineFiles, images?: ReadonlyMap<string, string>): CardElement[] {
@@ -23,59 +23,32 @@ export function fileComponentCount(elements: CardElement[]): number {
     + (Array.isArray(element.columns) && element.tag !== 'table' ? fileComponentCount(element.columns as CardElement[]) : 0), 0);
 }
 
-/** Markdown has no inline callbacks. Replace only lines containing file
- * tokens with wrapping rows of text and borderless interactive text. All other
- * elements retain the existing renderer, including images and ordinary tables. */
+/** Markdown has no inline callbacks. Keep prose in one full-width paragraph
+ * and place clickable files below it. Mixing long prose and file controls in
+ * auto-width columns squeezes Chinese filenames into vertical stacks. */
 export function placeInlineFiles(elements: CardElement[], files: InlineFiles): CardElement[] {
   if (!files.links.length) return elements;
-  const links = new Map(files.links.map(({ token, element }) => [token, element]));
+  const links = new Map(files.links.map((link) => [link.token, link]));
   const tokens = [...links.keys()];
   const tokenPattern = new RegExp(`(${tokens.map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`);
+  const replacementPattern = new RegExp(tokenPattern.source, 'g');
   const hasToken = (text: string): boolean => tokens.some((token) => text.includes(token));
   const renderText = (element: CardElement): CardElement[] => {
     const text = String(element.content ?? '');
     if (!hasToken(text)) return [element];
     const result: CardElement[] = [];
-    let buffered: string[] = [];
-    const flush = (): void => {
-      if (buffered.some((line) => line.trim())) result.push({ ...element, content: buffered.join('\n') });
-      buffered = [];
-    };
-    for (const line of text.split('\n')) {
-      if (!hasToken(line)) { buffered.push(line); continue; }
-      flush();
-      const pieces: CardElement[] = [];
-      let rest = line;
-      // Preserve list numbering when a markdown list is split into components.
-      rest = rest.replace(/^(\s*)[-+*]\s+/, '$1• ')
-        .replace(/^(\s*\d+)[.)]\s+/, '$1\\. ');
-      const heading = /^(#{1,6})\s+/.exec(rest);
-      if (heading) rest = rest.slice(heading[0].length);
-      const textSize = heading ? (heading[1]!.length === 1 ? 'heading-3' : 'heading-4') : element.text_size;
-      let bold = false;
-      const pushText = (content: string): void => {
-        // A file may sit inside **bold prose**. Close/reopen emphasis around
-        // component boundaries so standalone ** markers never become visible.
-        const prefix = bold ? '**' : '';
-        if ((content.match(/(?<!\\)\*\*/g)?.length ?? 0) % 2) bold = !bold;
-        const balanced = (prefix + content + (bold ? '**' : ''))
-          .replace(/^(\*\*)(\s+)/, '$2$1').replace(/(\s+)(\*\*)$/, '$2$1');
-        if (balanced.replace(/\*\*/g, '').trim() || (content.length > 0 && /^\s+$/.test(content))) {
-          const spaced = balanced.replace(/^ +| +$/g, (spaces) => '&nbsp;'.repeat(spaces.length));
-          pieces.push({ ...element, content: spaced, ...(textSize ? { text_size: textSize } : {}) });
-        }
-      };
-      for (const part of rest.split(tokenPattern)) {
+    for (const block of text.split(/\n{2,}/)) {
+      if (!block.trim()) continue;
+      const references = block.split(tokenPattern).flatMap((part) => {
         const link = links.get(part);
-        if (link) pieces.push(link);
-        else pushText(part);
-      }
-      result.push(pieces.length === 1 ? pieces[0]! : columns(
-        pieces.map((el) => ({ elements: [el], verticalAlign: 'center' })),
-        { flexMode: 'flow', spacing: '0px' },
-      ));
+        return link ? [link] : [];
+      });
+      // A standalone file already has a visible label on its clickable control.
+      const standalone = references.length === 1 &&
+        [references[0]!.token, `**${references[0]!.token}**`].includes(block.trim());
+      if (!standalone) result.push({ ...element, content: block.replace(replacementPattern, (token) => links.get(token)!.fallback) });
+      result.push(...references.map((link) => link.element));
     }
-    flush();
     return result;
   };
   const visit = (element: CardElement): CardElement[] => {

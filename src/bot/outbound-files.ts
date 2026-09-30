@@ -77,7 +77,7 @@ function fileText(id: string, index: number, file: FileEntry, chatId: string,
     .replace(/([\\`*_[\]{}()!#|])/g, '\\$1');
   return {
     tag: 'interactive_container', element_id: occurrence.elementId,
-    width: 'auto', height: 'auto', direction: 'vertical',
+    width: 'fill', height: 'auto', direction: 'vertical',
     background_style: 'default', has_border: false, corner_radius: '0px', padding: '0px', margin: '0px',
     behaviors: [behavior], disabled: sending,
     hover_tips: { tag: 'plain_text', content: hint },
@@ -245,7 +245,7 @@ export class OutboundFiles {
         const occurrence = { elementId: `local_file_${links.length}`, label: ref.label };
         file.occurrences.push(occurrence);
         const token = `${prefix}${links.length}END`;
-        links.push({ token, element: fileText(id, index, file, context.chatId, occurrence) });
+        links.push({ token, fallback: ref.fallback, element: fileText(id, index, file, context.chatId, occurrence) });
         edit.text = token;
       } catch (err) {
         log.info('outbound', 'file-unavailable', { reason: friendly(err) });
