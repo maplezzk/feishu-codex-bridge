@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createGracefulInterrupt,
+  IdleTimeoutSetting,
   INTERRUPT_DRAIN_TIMEOUT_MS,
   Semaphore,
   withIdleTimeout,
@@ -187,6 +188,103 @@ describe('withIdleTimeout', () => {
     await vi.advanceTimersByTimeAsync(80);
     await done;
     expect(out).toEqual(['late']);
+    expect(onTimeout).not.toHaveBeenCalled();
+  });
+
+  it('disabling a live timer keeps the pending value and does not terminate the source', async () => {
+    vi.useFakeTimers();
+    const setting = new IdleTimeoutSetting(50);
+    const onTimeout = vi.fn();
+    const out: string[] = [];
+    const done = (async () => {
+      for await (const value of withIdleTimeout(delayedValues([{ delayMs: 100, value: 'late' }]), setting, onTimeout)) out.push(value);
+    })();
+    await vi.advanceTimersByTimeAsync(25);
+    setting.update(0);
+    await vi.advanceTimersByTimeAsync(75);
+    await done;
+    expect(out).toEqual(['late']);
+    expect(onTimeout).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('lengthening then shortening a live timeout recalculates from the last activity', async () => {
+    vi.useFakeTimers();
+    const setting = new IdleTimeoutSetting(50);
+    const onTimeout = vi.fn();
+    const iter = withIdleTimeout(neverEnding('first'), setting, onTimeout);
+    await iter.next();
+    const next = iter.next();
+    await vi.advanceTimersByTimeAsync(25);
+    setting.update(100);
+    await vi.advanceTimersByTimeAsync(35);
+    expect(onTimeout).not.toHaveBeenCalled();
+    setting.update(40); // Already idle for 60ms: expire at once under the new threshold.
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(next).resolves.toEqual({ done: true, value: undefined });
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it('enabling while a turn is running starts a timer and manual stop still works while disabled', async () => {
+    vi.useFakeTimers();
+    const setting = new IdleTimeoutSetting(0);
+    const onTimeout = vi.fn();
+    let stop!: () => void;
+    const signal = new Promise<void>(resolve => { stop = resolve; });
+    const iter = withIdleTimeout(neverEnding('first'), setting, onTimeout, signal);
+    await iter.next();
+    const next = iter.next();
+    await vi.advanceTimersByTimeAsync(10);
+    setting.update(50);
+    await vi.advanceTimersByTimeAsync(30);
+    expect(onTimeout).not.toHaveBeenCalled();
+    setting.update(0);
+    await vi.advanceTimersByTimeAsync(100);
+    stop();
+    await next;
+    expect(onTimeout).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('honors disabling at the old deadline before the timer continuation runs', async () => {
+    vi.useFakeTimers();
+    const setting = new IdleTimeoutSetting(50);
+    const onTimeout = vi.fn();
+    let stop!: () => void;
+    const signal = new Promise<void>(resolve => { stop = resolve; });
+    const iter = withIdleTimeout(neverEnding('first'), setting, onTimeout, signal);
+    await iter.next();
+    const next = iter.next();
+    vi.advanceTimersByTime(50); // Old timer resolved, but its await has not resumed.
+    setting.update(0);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(onTimeout).not.toHaveBeenCalled();
+    stop();
+    await next;
+  });
+
+  it('enabling a disabled watchdog can expire the current idle turn', async () => {
+    vi.useFakeTimers();
+    const setting = new IdleTimeoutSetting(0);
+    const onTimeout = vi.fn();
+    const iter = withIdleTimeout(neverEnding('first'), setting, onTimeout);
+    await iter.next();
+    const next = iter.next();
+    await vi.advanceTimersByTimeAsync(10);
+    setting.update(50);
+    await vi.advanceTimersByTimeAsync(40);
+    await next;
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  it('cleans up its live subscription when the source rejects', async () => {
+    vi.useFakeTimers();
+    const setting = new IdleTimeoutSetting(50);
+    const onTimeout = vi.fn();
+    async function* broken(): AsyncGenerator<string> { throw new Error('source failed'); }
+    await expect(withIdleTimeout(broken(), setting, onTimeout).next()).rejects.toThrow('source failed');
+    setting.update(0);
+    expect(vi.getTimerCount()).toBe(0);
     expect(onTimeout).not.toHaveBeenCalled();
   });
 

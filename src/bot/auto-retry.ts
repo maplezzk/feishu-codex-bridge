@@ -39,6 +39,8 @@ export interface AutoRetryInput {
   /** 能不能续：没有可续的会话记录就没得重试 */
   canResume: boolean;
   maxAttempts?: number;
+  /** The watchdog may have been disabled while terminal delivery was pending. */
+  enabled?: boolean;
 }
 
 export type AutoRetryDecision =
@@ -49,6 +51,7 @@ export type AutoRetryDecision =
 export function decideAutoRetry(input: AutoRetryInput): AutoRetryDecision {
   const maxAttempts = input.maxAttempts ?? AUTO_RETRY_MAX_ATTEMPTS;
   if (input.interrupted) return { retry: false, reason: 'user-interrupt' };
+  if (input.enabled === false) return { retry: false, reason: 'watchdog-disabled' };
   if (input.protocolFault) return { retry: false, reason: 'protocol-fault' };
   // 干净收尾（done/error/中断）不是「断了」，重试只会重复劳动。
   if (!input.timedOut && !input.procDead) return { retry: false, reason: 'clean-terminal' };

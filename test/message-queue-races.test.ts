@@ -14,12 +14,14 @@ const fake = vi.hoisted(() => ({
   send: vi.fn(async () => ({})),
   questionSend: vi.fn(async (..._args: any[]) => ({ messageId: 'question-card' })),
   questionUpdate: vi.fn(async () => true),
+  saveConfig: vi.fn(async () => undefined),
   log: { info: vi.fn(), warn: vi.fn(), fail: vi.fn() },
 }));
 vi.mock('../src/card/managed', async original => ({
   ...await original<object>(), sendManagedCard: fake.questionSend, updateManagedCard: fake.questionUpdate,
 }));
 vi.mock('../src/bot/steer-delivery', async original => { const real = await original<typeof import('../src/bot/steer-delivery')>(); return { ...real, steerWithDeadline: (thread: any, input: any, id: string) => real.steerWithDeadline(thread, input, id, undefined, 150) }; });
+vi.mock('../src/config/store', async original => ({ ...await original<object>(), saveConfig: fake.saveConfig }));
 vi.mock('../src/core/logger', () => ({ log: fake.log, withTrace: (_ctx: unknown, fn: () => unknown) => fn() }));
 vi.mock('../src/agent', async (original) => ({ ...await original<object>(), createBackend: () => fake.backend }));
 vi.mock('../src/project/registry', async (original) => ({
@@ -105,8 +107,11 @@ function message(text: string): NormalizedMessage {
   return { messageId: `msg-${++seq}`, chatId: 'chat', chatType: 'group', threadId: 'topic',
     content: text, senderId: 'owner', senderName: 'Owner', mentionedBot: true, createTime: Date.now(), rawContentType: 'text', resources: [], mentions: [], mentionAll: false };
 }
-function setup(policy: 'steer' | 'queue' = 'steer') {
+let testConfig: AppConfig;
+function setup(policy: 'steer' | 'queue' = 'steer', idleSeconds?: number) {
   const cfg: AppConfig = { accounts: { app: { id: 'app', secret: 'test', tenant: 'feishu' } }, preferences: { pendingPolicy: policy, access: { ownerOpenId: 'owner' }, completionReminder: { mode: 'manual' } } };
+  testConfig = cfg;
+  if (idleSeconds !== undefined) cfg.preferences!.runIdleTimeoutSeconds = idleSeconds;
   const channel = { send: fake.send, rawClient: { im: { v1: { message: { get: async () => ({ data: { items: [{ thread_id: 'new-topic' }] } }) }, messageReaction: {
     create: async () => ({ data: {} }), delete: async () => ({}),
   } } } } };
@@ -126,9 +131,139 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await orchestrator?.shutdown();
+  vi.useRealTimers();
 });
 // Keep synchronization polling well below the injected 150ms steer deadline.
 const until = (check: () => void) => vi.waitFor(check, { interval: 5 });
+
+async function setWatchdog(seconds: number) {
+  await orchestrator.dispatcher.handle({ chatId: 'dm', messageId: 'settings', operator: { openId: 'owner' },
+    action: { value: { a: 'dm.set.watchdog', v: String(seconds) }, tag: 'button' }, raw: {},
+  } as never);
+  await until(() => expect(testConfig.preferences?.runIdleTimeoutSeconds).toBe(seconds));
+}
+
+// Exercise the real settings callback, persisted LIVE commit, watchdog and retry loop together.
+describe('watchdog configuration hot reload', () => {
+  it('closing during an active turn keeps that turn alive beyond its old deadline', async () => {
+    vi.useFakeTimers();
+    const run = thread();
+    fake.backend.resumeThread.mockResolvedValue(run.t);
+    const o = setup('queue', 10);
+    await o.onMessage(message('work'));
+    await until(() => expect(run.consumed).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(5_000);
+    await setWatchdog(0);
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(run.t.close).not.toHaveBeenCalled();
+    expect(fake.log.info).not.toHaveBeenCalledWith('agent', 'auto-retry', expect.anything());
+    run.turns[0]!.resolve();
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.objectContaining({ terminal: 'done' })));
+  });
+
+  it('closing during backoff cancels the retry immediately and reopening does not revive it', async () => {
+    vi.useFakeTimers();
+    const run = thread();
+    fake.backend.resumeThread.mockResolvedValue(run.t);
+    const o = setup('queue', 10);
+    await o.onMessage(message('work'));
+    await until(() => expect(run.consumed).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(10_000);
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('agent', 'auto-retry', expect.anything()));
+    await setWatchdog(0);
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('agent', 'auto-retry-stopped', expect.anything()));
+    await setWatchdog(10);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fake.backend.resumeThread).toHaveBeenCalledTimes(1);
+    expect(run.consumed).toHaveLength(1);
+  });
+
+  it('closing while terminal delivery is pending prevents scheduling a retry', async () => {
+    vi.useFakeTimers();
+    const run = thread();
+    fake.backend.resumeThread.mockResolvedValue(run.t);
+    const o = setup('queue', 10);
+    await o.onMessage(message('work'));
+    await until(() => expect(run.consumed).toHaveLength(1));
+    const final = deferred<boolean>();
+    fake.final.mockReturnValueOnce(final.promise);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await until(() => expect(run.t.close).toHaveBeenCalled());
+    await setWatchdog(0);
+    final.resolve(true);
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('agent', 'auto-retry-skip', expect.objectContaining({ reason: 'watchdog-disabled' })));
+    expect(fake.log.info).not.toHaveBeenCalledWith('agent', 'auto-retry', expect.anything());
+  });
+
+  it('closing during session recovery does not submit the retried input', async () => {
+    vi.useFakeTimers();
+    const run = thread();
+    fake.backend.resumeThread.mockResolvedValue(run.t);
+    const o = setup('queue', 10);
+    await o.onMessage(message('work'));
+    await until(() => expect(run.consumed).toHaveLength(1));
+    const recovery = deferred<ReturnType<typeof thread>['t']>();
+    fake.backend.resumeThread.mockReturnValueOnce(recovery.promise);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await until(() => expect(fake.backend.resumeThread).toHaveBeenCalledTimes(2));
+    await setWatchdog(0);
+    const resumed = thread();
+    recovery.resolve(resumed.t);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(resumed.consumed).toHaveLength(0);
+    expect(fake.log.info).not.toHaveBeenCalledWith('agent', 'auto-retry-resume', expect.anything());
+  });
+
+  it('still retries successfully when the watchdog remains enabled', async () => {
+    vi.useFakeTimers();
+    const run = thread();
+    const resumed = thread();
+    fake.backend.resumeThread.mockResolvedValueOnce(run.t).mockResolvedValueOnce(resumed.t);
+    const o = setup('queue', 10);
+    await o.onMessage(message('work'));
+    await until(() => expect(run.consumed).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(30_000);
+    await until(() => expect(resumed.consumed).toHaveLength(1));
+    expect(resumed.consumed[0]).toEqual(run.consumed[0]);
+    resumed.turns[0]!.resolve();
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.objectContaining({ terminal: 'done' })));
+  });
+
+  it('manual stop during backoff still cancels the retry', async () => {
+    vi.useFakeTimers();
+    const run = thread();
+    fake.backend.resumeThread.mockResolvedValue(run.t);
+    const o = setup('queue', 10);
+    await o.onMessage(message('work'));
+    await until(() => expect(run.consumed).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(10_000);
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('agent', 'auto-retry', expect.anything()));
+    await vi.advanceTimersByTimeAsync(0);
+    await o.dispatcher.handle({ chatId: 'chat', messageId: 'question-card', operator: { openId: 'owner' },
+      action: { value: { a: 'run.stop' }, tag: 'button' }, raw: {},
+    } as never);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fake.backend.resumeThread).toHaveBeenCalledTimes(1);
+    expect(fake.log.info).toHaveBeenCalledWith('agent', 'auto-retry-stopped', expect.anything());
+  });
+
+  it('failed persistence leaves the active watchdog and retry policy unchanged', async () => {
+    vi.useFakeTimers();
+    const run = thread();
+    fake.backend.resumeThread.mockResolvedValue(run.t);
+    const o = setup('queue', 10);
+    await o.onMessage(message('work'));
+    await until(() => expect(run.consumed).toHaveLength(1));
+    fake.saveConfig.mockRejectedValueOnce(new Error('disk failed'));
+    await o.dispatcher.handle({ chatId: 'dm', messageId: 'settings', operator: { openId: 'owner' },
+      action: { value: { a: 'dm.set.watchdog', v: '0' }, tag: 'button' }, raw: {},
+    } as never);
+    await until(() => expect(fake.log.fail).toHaveBeenCalledWith('console', expect.anything(), { phase: 'save-config' }));
+    expect(testConfig.preferences?.runIdleTimeoutSeconds).toBe(10);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('agent', 'auto-retry', expect.anything()));
+  });
+});
 
 describe('message queue lifecycle', () => {
   it('adopts a new goal topic before opening its first async question and steers the owner answer', async () => {
