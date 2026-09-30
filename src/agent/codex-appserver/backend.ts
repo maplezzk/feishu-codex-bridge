@@ -22,6 +22,7 @@ import type {
 import { isGoalTerminal } from '../types';
 import { BRIDGE_DEVELOPER_INSTRUCTIONS } from '../bridge-instructions';
 import { AppServerClient } from './app-server-client';
+import type { AppServerStreamEvent } from './app-server-client';
 import { refillWarmPool, takeWarmClient, utilityRequest } from './client-pool';
 import { mapNotification } from './event-map';
 import { codexVersionAsync, resolveCodexBin } from './locate';
@@ -69,6 +70,14 @@ export function withAutoCompact(
   if (autoCompact !== false) return params;
   const config = (params.config as Record<string, unknown> | undefined) ?? {};
   return { ...params, config: { ...config, model_auto_compact_token_limit: AUTO_COMPACT_OFF_LIMIT } };
+}
+
+const REQUEST_USER_INPUT_CONFIG = { 'features.default_mode_request_user_input': true } as const;
+
+/** Enable Codex's default-mode request_user_input support on live threads. */
+function withUserInput(params: Record<string, unknown>): Record<string, unknown> {
+  const config = (params.config as Record<string, unknown> | undefined) ?? {};
+  return { ...params, config: { ...config, ...REQUEST_USER_INPUT_CONFIG } };
 }
 
 export function sandboxParams(
@@ -128,6 +137,24 @@ function toUserInput(input: AgentInput): unknown[] {
   if (input.text) out.push({ type: 'text', text: input.text, text_elements: [] });
   for (const path of input.images ?? []) out.push({ type: 'localImage', path });
   return out;
+}
+
+function isUserInputEvent(
+  event: AppServerStreamEvent,
+): event is Extract<AppServerStreamEvent, { method: 'bridge/userInput' }> {
+  return event.method === 'bridge/userInput';
+}
+
+function rejectWrongUserInputScope(
+  request: Extract<AppServerStreamEvent, { method: 'bridge/userInput' }>['params'],
+  expectedThreadId: string,
+  expectedTurnId: string | undefined,
+): void {
+  if (!request.isPending()) return;
+  const scope = `thread=${expectedThreadId}, turn=${expectedTurnId ?? 'unknown'}`;
+  void request.reject(`User input request scope mismatch (${scope})`).catch((err: unknown) => {
+    log.fail('agent', err, { phase: 'user-input/reject-scope', requestId: request.requestId });
+  });
 }
 
 /** Narrow structural surface used by the isolated title job (and its mocks). */
@@ -362,10 +389,12 @@ class CodexThread implements AgentThread {
     // first turn/started (it may belong to an old turn or a subagent).
     // Observe rejection eagerly, even if card creation delays consumption.
     let activeTurnId: string | undefined;
+    let ownedTurnId: string | undefined;
     const started = self.client.request<TurnStartResponse>('turn/start', params)
       .then((result) => {
         if (!result.turn?.id) throw new Error('turn/start response missing turn id');
         activeTurnId = result.turn.id;
+        ownedTurnId = result.turn.id;
         return { turnId: result.turn.id };
       })
       .catch((err: unknown) => {
@@ -382,7 +411,17 @@ class CodexThread implements AgentThread {
         }
         // Do not race stream.next() with start failure: the losing read would
         // remain queued and steal the next request's first notification.
-        for await (const notification of self.client.stream()) {
+        for await (const event of self.client.streamEvents()) {
+          if (isUserInputEvent(event)) {
+            const request = event.params;
+            if (request.threadId !== self.sessionId || request.turnId !== result.turnId) {
+              rejectWrongUserInputScope(request, self.sessionId, result.turnId);
+              continue;
+            }
+            if (request.isPending()) yield { type: 'user_input_request', request };
+            continue;
+          }
+          const notification = event;
           const p = notification.params;
           const scope = p as { threadId?: string; turnId?: string; turn?: { id?: string } };
           const eventTurnId = scope.turnId ?? scope.turn?.id;
@@ -420,9 +459,24 @@ class CodexThread implements AgentThread {
         }
       } finally {
         activeTurnId = undefined;
+        await self.client.rejectPendingUserInputs(
+          { threadId: self.sessionId, turnId: ownedTurnId },
+          'The turn ended before the user input request was answered',
+        ).catch((err: unknown) => {
+          log.fail('agent', err, { phase: 'user-input/turn-cleanup', threadId: self.sessionId, turnId: ownedTurnId });
+        });
       }
     }
-    return { events: gen(), turnId: () => activeTurnId, lastActivity: () => lastActivityAt };
+    return {
+      events: gen(),
+      turnId: () => activeTurnId,
+      lastActivity: () => {
+        if (!self.client.exited && activeTurnId && self.client.hasPendingUserInput({ threadId: self.sessionId, turnId: activeTurnId })) {
+          return Date.now();
+        }
+        return lastActivityAt;
+      },
+    };
   }
 
   runGoal(objective: string): AgentRun {
@@ -458,7 +512,7 @@ class CodexThread implements AgentThread {
           });
       });
 
-      const stream = self.client.stream()[Symbol.asyncIterator]();
+      const stream = self.client.streamEvents()[Symbol.asyncIterator]();
       // Guard against a STALE goal snapshot: resuming a thread that had a prior
       // goal re-emits a thread/goal/updated for THAT goal (often already complete)
       // around resume time — before ours runs. If we honored it we'd "complete"
@@ -477,6 +531,19 @@ class CodexThread implements AgentThread {
           }
           if (step.done) return;
           lastActivityAt = Date.now();
+          if (isUserInputEvent(step.value)) {
+            const request = step.value.params;
+            if (request.threadId !== self.sessionId || request.turnId !== self.currentTurnId) {
+              rejectWrongUserInputScope(request, self.sessionId, self.currentTurnId);
+              continue;
+            }
+            if (request.isPending()) yield { type: 'user_input_request', request };
+            continue;
+          }
+          // Child threads share this transport. Their turn boundaries must not
+          // replace the goal's parent turn or invalidate its question scope.
+          const scope = step.value.params as { threadId?: string };
+          if (scope.threadId && scope.threadId !== self.sessionId) continue;
           const ev = mapNotification(step.value);
           if (!ev) continue;
           if (ev.type === 'turn_started') {
@@ -488,6 +555,7 @@ class CodexThread implements AgentThread {
           }
           if (ev.type === 'done') {
             turnActive = false;
+            self.currentTurnId = undefined;
             yield ev;
             // The goal is terminal AND its final turn just finished — now stop.
             if (goalDone) return;
@@ -514,10 +582,29 @@ class CodexThread implements AgentThread {
         }
       } finally {
         await stream.return?.();
+        await self.client.rejectPendingUserInputs(
+          { threadId: self.sessionId },
+          'The goal ended before the user input request was answered',
+        ).catch((err: unknown) => {
+          log.fail('agent', err, { phase: 'user-input/goal-cleanup', threadId: self.sessionId });
+        });
         self.currentTurnId = undefined;
       }
     }
-    return { events: gen(), turnId: () => self.currentTurnId, lastActivity: () => lastActivityAt };
+    return {
+      events: gen(),
+      turnId: () => self.currentTurnId,
+      lastActivity: () => {
+        if (
+          !self.client.exited &&
+          self.currentTurnId &&
+          self.client.hasPendingUserInput({ threadId: self.sessionId, turnId: self.currentTurnId })
+        ) {
+          return Date.now();
+        }
+        return lastActivityAt;
+      },
+    };
   }
 
   async clearGoal(): Promise<void> {
@@ -754,7 +841,7 @@ export class CodexAppServerBackend implements AgentBackend {
   async startThread(opts: StartThreadOptions): Promise<AgentThread> {
     // Build sandbox params first — the platform fail-closed guard throws here,
     // before we spawn, so a rejected tier leaves no orphan app-server process.
-    const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
+    const sandbox = withUserInput(withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact));
     for (let attempt = 0; ; attempt++) {
       if (this.retryStopped) throw new Error('agent retry stopped');
       let client: AppServerClient | undefined;
@@ -789,7 +876,7 @@ export class CodexAppServerBackend implements AgentBackend {
   }
 
   async resumeThread(opts: ResumeThreadOptions): Promise<AgentThread> {
-    const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
+    const sandbox = withUserInput(withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact));
     // provider 记在会话里（rollout session_meta），codex 默认沿用建会话时那一个：
     // 用户改了 config.toml 也切不过去，旧会话会一直打旧 provider。所以每次 resume
     // 现读一次 config 顶层的 model_provider 显式覆盖——改完 config，下一条消息即生效。

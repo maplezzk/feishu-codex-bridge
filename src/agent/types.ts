@@ -109,6 +109,30 @@ export interface ThreadHistory {
   updatedAt?: number;
 }
 
+/** One structured question emitted by Codex's request_user_input tool. */
+export interface AgentUserInputQuestion {
+  id: string;
+  header: string;
+  question: string;
+  isOther: boolean;
+  isSecret: boolean;
+  options: Array<{ label: string; description: string }> | null;
+}
+
+/** A pending request_user_input call that can be answered by the orchestrator. */
+export interface AgentUserInputRequest {
+  requestId: string | number;
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  questions: AgentUserInputQuestion[];
+  autoResolutionMs?: number | null;
+  isPending(): boolean;
+  respond(answers: Record<string, { answers: string[] }>): Promise<void>;
+  reject(reason: string): Promise<void>;
+  onResolved(listener: (reason: string) => void): () => void;
+}
+
 /**
  * Coarse tool category, set by each backend's event-map so the card can render
  * a tool correctly without re-parsing its title. `command` — a shell command
@@ -124,6 +148,7 @@ export type ToolKind = 'command' | 'file' | 'search' | 'tool';
 export type AgentEvent =
   | { type: 'system'; threadId: string }
   | { type: 'turn_started'; turnId: string }
+  | { type: 'user_input_request'; request: AgentUserInputRequest }
   | { type: 'text_delta'; itemId: string; delta: string }
   | { type: 'text'; itemId: string; text: string }
   | { type: 'thinking_delta'; itemId: string; delta: string }

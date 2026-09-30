@@ -71,6 +71,7 @@ import {
   type SessionTitleBackendConfig,
 } from '../config/schema';
 import { CardDispatcher } from '../card/dispatcher';
+import { createUserInputService } from '../card/user-input';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
 import { RunRender } from '../card/run-render';
 import { finalMessageText, initialState, reduce, type RunState } from '../card/run-state';
@@ -2262,6 +2263,16 @@ export function createOrchestrator(
 
   // ── card actions ──────────────────────────────────────────────────
   const dispatcher = new CardDispatcher(channel, cfg);
+  const userInputs = createUserInputService({
+    send: (scope, card) => sendManagedCard(channel, scope.chatId, card, scope.replyToMessageId, scope.inThread),
+    update: (messageId, card) => updateManagedCard(channel, messageId, card),
+    notify: (scope, text) => channel.send(scope.chatId, { text }, {
+      replyTo: scope.replyToMessageId,
+      replyInThread: scope.inThread,
+    }),
+    onError: (err, phase) => log.fail('card', err, { phase: `user-input-${phase}` }),
+  });
+  userInputs.register(dispatcher);
   const outboundFiles = new OutboundFiles(paths.outboundFilesDir);
   void outboundFiles.recover(channel);
   outboundFiles.register(dispatcher, async (record, openId) => {
@@ -4620,6 +4631,15 @@ export function createOrchestrator(
         let evCount = 0;
         let textChars = 0;
         for await (const ev of cardEvents.consume(guarded)) {
+          if (ev.type === 'user_input_request') {
+            void userInputs.open(ev.request, {
+              chatId: opts.chatId,
+              replyToMessageId: cardMsgId,
+              inThread: !opts.flat,
+              requesterOpenId: state.requesterOpenId,
+            }).catch((err) => log.fail('card', err, { phase: 'user-input-open' }));
+            continue;
+          }
           if (ev.type === 'steer_accepted') {
             await splitCard(ev);
             continue;
@@ -5014,6 +5034,7 @@ export function createOrchestrator(
       // A replacement run may have reserved the key while failure feedback
       // was in flight. Never delete another run's reservation.
       if (active.get(activeKey) === state) active.delete(activeKey);
+      await userInputs.closeThread(thread.sessionId, 'run-ended');
       clearInterval(cardClock);
       state.steerReply = undefined;
       state.voiceReply = undefined;
@@ -5313,6 +5334,15 @@ export function createOrchestrator(
         idledOut = true;
       }, stop, run.lastActivity);
       for await (const ev of guarded) {
+        if (ev.type === 'user_input_request') {
+          void userInputs.open(ev.request, {
+            chatId: opts.chatId,
+            replyToMessageId: cur?.cardMsgId ?? replyTo,
+            inThread: !opts.flat,
+            requesterOpenId: state.requesterOpenId,
+          }).catch((err) => log.fail('card', err, { phase: 'user-input-open' }));
+          continue;
+        }
         if (ev.type === 'goal_update') {
           lastStatus = ev.status;
           goalTokens = ev.tokensUsed;
@@ -5420,6 +5450,7 @@ export function createOrchestrator(
         .catch(() => undefined);
     } finally {
       clearInterval(cur?.clock);
+      await userInputs.closeThread(opts.thread.sessionId, 'run-ended');
       active.delete(activeKey);
       if (cur?.cardMsgId) runsByCard.delete(cur.cardMsgId);
       // Recycle the codex process (it may still be mid-goal, and a terminated goal
@@ -5524,7 +5555,14 @@ export function createOrchestrator(
             const guarded = withIdleTimeout(run.events, currentIdleMs(), () => {
               timedOut = true;
             }, undefined, run.lastActivity);
-            for await (const ev of guarded) state = reduce(state, ev);
+            for await (const ev of guarded) {
+              if (ev.type === 'user_input_request') {
+                await ev.request.reject('Interactive questions are unavailable in document comments. Ask in the comment text instead.');
+                log.info('agent', 'user-input-unavailable', { scope: 'document-comment' });
+                continue;
+              }
+              state = reduce(state, ev);
+            }
 
             const protocolFault = thread.needsRecycle?.()
               ? thread.recycleReason?.() ?? 'Codex 协作状态已失步'
