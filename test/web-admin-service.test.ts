@@ -187,6 +187,15 @@ describe('createReadonlyAdminService · 只读方法（显式路径，不碰全�
     expect(await service.getProject(BOT_A, 'nope')).toBeUndefined();
   });
 
+  it('listProjects：回显项目已保存的默认模型与强度', async () => {
+    useBotDir(BOT_A);
+    const { updateProject } = await import('../src/project/registry');
+    await updateProject('proj-a', { defaultModel: 'gpt-6-sol', defaultEffort: 'high' });
+    useBotDir('cli_unrelated');
+    const project = await service.getProject(BOT_A, 'proj-a');
+    expect(project).toMatchObject({ defaultModel: 'gpt-6-sol', defaultEffort: 'high' });
+  });
+
   it('listSessions：按项目 chatId 过滤并按 updatedAt 新→旧排序', async () => {
     const sessions = await service.listSessions(BOT_A, 'proj-a');
     expect(sessions.map((s) => s.threadId)).toEqual(['t1', 't2']);

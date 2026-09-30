@@ -535,6 +535,7 @@ export const UI_HTML = `<!doctype html>
   .proj .name { font-weight: 600; font-size: 14px; }
   .proj .meta { margin: 4px 0 8px; }
   .proj .path { color: var(--text-2); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .model-select { display: block; width: 100%; max-width: 360px; margin: 8px 0; padding: 7px 10px; border: 1px solid var(--border-2); border-radius: 8px; background: var(--panel); color: var(--text); font-size: 13px; }
   .statline { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
   #logbox {
     background: #0d0e14; color: #c9d1d9; border-radius: 10px; padding: 12px 14px;
@@ -814,6 +815,8 @@ ${UI_PURE_JS}
   var updateChecking = false;// in-flight 闸：npm view 可能数秒~20s，期间 5s 重渲不叠发第二个请求
   var updateInFlight = false; // 「升级并重启」in-flight：禁用按钮防重复点击（并发触发会绕过服务端更新锁的窄窗），并驱动轮询结果
   var drawerProject = null;  // 抽屉里打开的项目名
+  var projectModels = {};    // bot + 项目 + 后端 → 当前模型列表；打开抽屉时刷新
+  var modelDraft = null;      // 保留编辑中的选择，避免 5s 状态刷新重置表单
   var diagBotId = null;      // diag 属于哪个 bot（防串台）
   var bkDetailId = null;     // 后端 Agent 详情视图当前展开的后端 id（null=列表）
 
@@ -2350,6 +2353,7 @@ ${UI_PURE_JS}
       if (p.origin === 'joined') meta.appendChild(el('span', 'tag', '🔗 已加入'));
       meta.appendChild(el('span', 'tag ' + (p.mode === 'full' ? 'orange' : 'green'), '🔐 ' + permissionSummary(p)));
       meta.appendChild(el('span', 'tag blue', '🧠 ' + p.backend));
+      meta.appendChild(el('span', 'tag', '🤖 ' + (p.defaultModel || '后端默认') + (p.defaultEffort ? ' · ' + p.defaultEffort : '')));
       meta.appendChild(el('span', 'tag', '🧵 ' + p.sessionCount + ' 话题'));
       meta.appendChild(el('span', 'tag', '✋ 免@：' + (p.noMention ? '开' : '关')));
       item.appendChild(meta);
@@ -2366,12 +2370,15 @@ ${UI_PURE_JS}
   // ── 项目详情抽屉 ────────────────────────────────────────────────────────────
   function openDrawer(name) {
     drawerProject = name;
+    modelDraft = null;
     renderDrawer(name);
     $('drawer').classList.add('open');
     $('drawerMask').classList.add('open');
+    loadProjectModels(name);
   }
   function closeDrawer() {
     drawerProject = null;
+    modelDraft = null;
     var d = $('drawer'); if (d) d.classList.remove('open');
     var m = $('drawerMask'); if (m) m.classList.remove('open');
   }
@@ -2383,6 +2390,51 @@ ${UI_PURE_JS}
     return null;
   }
 
+  function modelKey(p) { return currentBotId() + ':' + p.name + ':' + p.backend; }
+  function loadProjectModels(name) {
+    var p = findProject(name); if (!p) return;
+    var key = modelKey(p);
+    projectModels[key] = { loading: true };
+    renderDrawer(name);
+    fetch('/api/project/' + encodeURIComponent(name) + '/models?bot=' + encodeURIComponent(currentBotId()))
+      .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.message || '模型列表获取失败'); return j; }); })
+      .then(function (j) { projectModels[key] = { models: j.models || [] }; if (drawerProject === name) renderDrawer(name); })
+      .catch(function (e) { projectModels[key] = { error: e.message }; if (drawerProject === name) renderDrawer(name); });
+  }
+
+  function renderModelSettings(d, p) {
+    d.appendChild(el('div', null, '🤖 新话题默认模型'));
+    d.appendChild(el('div', 'note', '当前：' + (p.defaultModel || '后端默认') + (p.defaultEffort ? ' · 强度 ' + p.defaultEffort : '') + '。只影响新话题，已有话题保留原设置。'));
+    var data = projectModels[modelKey(p)];
+    if (!data) { d.appendChild(el('div', 'note', '打开设置后加载模型列表…')); return; }
+    if (data.loading) { d.appendChild(el('div', 'note', '正在加载模型列表…')); return; }
+    if (data.error) { d.appendChild(el('div', 'note', '❌ ' + data.error)); var retry = el('button', 'btn', '重试'); retry.onclick = function () { loadProjectModels(p.name); }; d.appendChild(retry); return; }
+    var models = data.models || [];
+    if (!models.length) { d.appendChild(el('div', 'note', '当前后端没有可选模型')); return; }
+    var modelSelect = el('select', 'model-select');
+    models.forEach(function (m) { var o = el('option', null, m.displayName + ' (' + m.id + ')'); o.value = m.id; modelSelect.appendChild(o); });
+    var savedModel = modelDraft && modelDraft.key === modelKey(p) ? modelDraft.model : p.defaultModel;
+    modelSelect.value = models.some(function (m) { return m.id === savedModel; }) ? savedModel : ((models.find(function (m) { return m.isDefault; }) || models[0]).id);
+    d.appendChild(modelSelect);
+    var effortSelect = el('select', 'model-select');
+    function refreshEfforts() {
+      var selected = models.find(function (m) { return m.id === modelSelect.value; });
+      effortSelect.textContent = '';
+      var efforts = selected ? selected.supportedEfforts || [] : [];
+      effortSelect.style.display = efforts.length ? '' : 'none';
+      efforts.forEach(function (e) { var o = el('option', null, '强度：' + e); o.value = e; effortSelect.appendChild(o); });
+      var savedEffort = modelDraft && modelDraft.key === modelKey(p) ? modelDraft.effort : p.defaultEffort;
+      effortSelect.value = efforts.indexOf(savedEffort) >= 0 && modelSelect.value === savedModel ? savedEffort : (selected ? selected.defaultEffort : '');
+    }
+    modelSelect.onchange = function () { savedModel = modelSelect.value; modelDraft = { key: modelKey(p), model: savedModel, effort: null }; refreshEfforts(); modelDraft.effort = effortSelect.value; };
+    refreshEfforts();
+    effortSelect.onchange = function () { modelDraft = { key: modelKey(p), model: modelSelect.value, effort: effortSelect.value }; };
+    d.appendChild(effortSelect);
+    var save = el('button', 'btn primary', '保存默认模型');
+    save.onclick = function () { postWrite('/api/project/' + encodeURIComponent(p.name) + '/model-default', { model: modelSelect.value, effort: effortSelect.style.display === 'none' ? undefined : effortSelect.value }); };
+    d.appendChild(save);
+  }
+
   // 写操作统一入口：200 ✅；501 = 只读预览；其余把服务端中文 message 弹出来。
   function postWrite(path, body) {
     var botId = currentBotId();
@@ -2392,7 +2444,7 @@ ${UI_PURE_JS}
     }).then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
       .then(function (resp) {
         if (resp.status === 501) toast('⏳ ' + (resp.body.message || '写操作需要 Feishu Bridge 在跑（当前为只读预览）'));
-        else if (resp.status === 200) { toast('✅ 已保存'); loadState(); }
+        else if (resp.status === 200) { if (path.indexOf('/model-default') >= 0) modelDraft = null; toast('✅ 已保存'); loadState(); }
         else toast('❌ ' + (resp.body.message || ('HTTP ' + resp.status)));
       })
       .catch(function () { toast('❌ 请求失败'); });
@@ -2447,6 +2499,9 @@ ${UI_PURE_JS}
     bkRO.appendChild(el('span', 'tag', '🔒 创建时锁定'));
     d.appendChild(bkRO);
     d.appendChild(el('div', 'note', '后端在新建项目时选定，运行时固定、不支持切换。如需更改，请删除该项目后用新后端重新创建。'));
+    d.appendChild(el('hr', 'hr'));
+
+    renderModelSettings(d, p);
     d.appendChild(el('hr', 'hr'));
 
     // ✋ 免@

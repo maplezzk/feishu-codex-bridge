@@ -51,6 +51,14 @@ function stubService(): AdminService {
     async getProject() {
       return undefined;
     },
+    async listProjectModels() {
+      return [
+        { id: 'gpt-6.1-sol', displayName: 'GPT-6.1 Sol', description: '', supportedEfforts: ['low' as const, 'high' as const], defaultEffort: 'low' as const, isDefault: true, hidden: false },
+      ];
+    },
+    async setModelDefault(_botId, _name, model, effort) {
+      throw new NotWiredYetError('🤖 设置默认模型');
+    },
     async switchBackend() {
       throw new NotWiredYetError('🧠 切换后端');
     },
@@ -318,6 +326,11 @@ describe('web server · 安全（loopback + token + Host 校验）', () => {
 });
 
 describe('web server · 只读 API', () => {
+  it('/api/project/:name/models：返回项目后端的可选模型与强度', async () => {
+    const res = await authed('/api/project/demo/models?bot=cli_a');
+    expect(res.status).toBe(200);
+    expect((await jsonOf(res)).models[0]).toMatchObject({ id: 'gpt-6.1-sol', supportedEfforts: ['low', 'high'] });
+  });
   it('/api/state 快照形状：version/generatedAt + bots[].projects[]', async () => {
     const body = await jsonOf(await authed('/api/state'));
     expect(typeof body.version).toBe('string');
@@ -388,11 +401,11 @@ describe('web server · 只读 API', () => {
 });
 
 describe('web server · 写操作占位（只读预览：daemon 未跑）', () => {
-  it.each(['backend', 'permission', 'no-mention', 'auto-compact'])('POST /api/project/demo/%s → 501', async (action) => {
+  it.each(['backend', 'permission', 'no-mention', 'auto-compact', 'model-default'])('POST /api/project/demo/%s → 501', async (action) => {
     const res = await authed(`/api/project/demo/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ backend: 'codex-appserver', mode: 'qa', on: true }),
+      body: JSON.stringify({ backend: 'codex-appserver', mode: 'qa', on: true, model: 'gpt-6.1-sol', effort: 'high' }),
     });
     expect(res.status).toBe(501);
     const body = await jsonOf(res);
@@ -434,6 +447,10 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     svc.setCompletionReminder = async (botId, value) => {
       written.push({ botId, completionReminder: value });
     };
+    svc.setModelDefault = async (botId, project, model, effort) => {
+      if (model !== 'gpt-6.1-sol' || effort !== 'high') throw new AdminWriteError('模型或强度无效');
+      written.push({ botId, project, model, effort });
+    };
     writeWeb = createWebServer({ service: svc, token: TOKEN, logDir });
     const { port } = await writeWeb.listen(0);
     writeBase = `http://127.0.0.1:${port}`;
@@ -452,6 +469,16 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     expect(res.status).toBe(200);
     expect((await jsonOf(res)).ok).toBe(true);
     expect(written).toEqual([{ botId: 'cli_a', project: 'demo', backend: 'codex-appserver' }]);
+  });
+
+  it('设置新话题默认模型：成功 200，非法强度 409，缺模型 400', async () => {
+    const send = (body: object) => fetch(`${writeBase}/api/project/demo/model-default?bot=cli_a`, {
+      method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    expect((await send({ model: 'gpt-6.1-sol', effort: 'high' })).status).toBe(200);
+    expect(written).toContainEqual({ botId: 'cli_a', project: 'demo', model: 'gpt-6.1-sol', effort: 'high' });
+    expect((await send({ model: 'gpt-6.1-sol', effort: 'ultra' })).status).toBe(409);
+    expect((await send({ effort: 'high' })).status).toBe(400);
   });
 
   it('校验拒绝（AdminWriteError）→ 409 write_rejected + 中文原因', async () => {

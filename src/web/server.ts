@@ -494,6 +494,24 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       return;
     }
 
+    // GET /api/project/:name/models —— 按项目当前后端列可选模型和强度。
+    const modelsMatch = /^\/api\/project\/([^/]+)\/models$/.exec(pathName);
+    if (req.method === 'GET' && modelsMatch) {
+      const botId = url.searchParams.get('bot') ?? (await defaultBotId());
+      if (!botId) {
+        sendJson(res, 404, { error: 'no_bot', message: '没有已注册的机器人' });
+        return;
+      }
+      try {
+        const models = await opts.service.listProjectModels(botId, decodeURIComponent(modelsMatch[1]!));
+        sendJson(res, 200, { models });
+      } catch (err) {
+        if (err instanceof AdminWriteError) sendJson(res, 404, { error: 'project_not_found', message: err.message });
+        else throw err;
+      }
+      return;
+    }
+
     // GET /api/project/:name/sessions —— 🧵 话题钻取
     const sessionsMatch = /^\/api\/project\/([^/]+)\/sessions$/.exec(pathName);
     if (req.method === 'GET' && sessionsMatch) {
@@ -509,7 +527,7 @@ export function createWebServer(opts: WebServerOptions): WebServer {
 
     // POST 写操作 —— daemon 进程内为真实写入（共享 admin/ops.ts，与 DM 卡片同
     // 源）；只读预览进程映射 501（NotWiredYetError），校验拒绝映射 409。
-    const writeMatch = /^\/api\/project\/([^/]+)\/(backend|permission|no-mention|auto-compact)$/.exec(pathName);
+    const writeMatch = /^\/api\/project\/([^/]+)\/(backend|permission|no-mention|auto-compact|model-default)$/.exec(pathName);
     if (req.method === 'POST' && writeMatch) {
       const project = decodeURIComponent(writeMatch[1]!);
       const action = writeMatch[2]!;
@@ -534,6 +552,12 @@ export function createWebServer(opts: WebServerOptions): WebServer {
             guestMode: body.guestMode as never,
             network: typeof body.network === 'boolean' ? body.network : undefined,
           });
+        } else if (action === 'model-default') {
+          if (typeof body.model !== 'string' || !body.model.trim() || (body.effort !== undefined && typeof body.effort !== 'string')) {
+            sendJson(res, 400, { error: 'invalid_input', message: '请选择模型和有效的推理强度' });
+            return;
+          }
+          await opts.service.setModelDefault(botId, project, body.model, body.effort as never);
         } else if (action === 'no-mention') {
           await opts.service.setNoMention(botId, project, body.on === true);
         } else {

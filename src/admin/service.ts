@@ -48,7 +48,7 @@ import {
   type InstallResult,
   type InstallProgress,
 } from '../agent';
-import type { BackendDepState, BackendProbe, PermissionMode } from '../agent/types';
+import type { BackendDepState, BackendProbe, ModelInfo, PermissionMode, ReasoningEffort } from '../agent/types';
 import { readRecentLogs } from '../core/logger';
 import { getServiceAdapter } from '../service/adapter';
 import {
@@ -60,7 +60,7 @@ import {
 } from '../service/update';
 import { bridgeVersion } from '../core/version';
 import { collectHostDoctor, toDaemonStatus, type DaemonStatus, type HostDoctor } from './host';
-import type { AdminWriteOp } from './ops';
+import { AdminWriteError, type AdminWriteOp } from './ops';
 
 /**
  * 管理面共享服务层（设计：.plans/auto-optimize/design/admin-surface.md）。
@@ -102,6 +102,10 @@ export interface AdminService {
   listProjects(botId: string): Promise<AdminProject[]>;
   /** 单个项目详情；不存在返回 undefined。 */
   getProject(botId: string, name: string): Promise<AdminProject | undefined>;
+  /** 当前项目后端可选模型，隐藏模型不展示。 */
+  listProjectModels(botId: string, name: string): Promise<ModelInfo[]>;
+  /** 设置项目新话题默认模型和推理强度。 */
+  setModelDefault(botId: string, name: string, model: string, effort?: ReasoningEffort): Promise<void>;
   /** 🧠 切换项目后端（写）。与 DM dm.proj.backend.submit 同一套校验+落盘。 */
   switchBackend(botId: string, projectName: string, backendId: string): Promise<void>;
   /** 🔐 设置权限档（管理员档/普通用户档/联网）（写），含驱逐活跃会话的既有语义。 */
@@ -298,6 +302,8 @@ export interface AdminProject {
   network: boolean;
   /** effective 后端 id（显式 backend ?? 智能默认 effectiveDefaultBackend，与运行时路由同源） */
   backend: string;
+  defaultModel?: string;
+  defaultEffort?: ReasoningEffort;
   allowedUsersCount: number;
   /** 🧵 话题数（该群名下的会话记录数） */
   sessionCount: number;
@@ -487,6 +493,8 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       guestMode: effectiveGuestMode(p),
       network: p.network ?? false,
       backend: p.backend ?? defaultBackend,
+      defaultModel: p.defaultModel,
+      defaultEffort: p.defaultEffort,
       allowedUsersCount: p.allowedUsers?.length ?? 0,
       sessionCount: p.chatId ? (countByChat.get(p.chatId) ?? 0) : 0,
       createdAt: p.createdAt,
@@ -567,6 +575,16 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
 
     async getProject(botId: string, name: string): Promise<AdminProject | undefined> {
       return (await projectsWithCounts(botId)).find((x) => x.name === name);
+    },
+
+    async listProjectModels(botId: string, name: string): Promise<ModelInfo[]> {
+      const project = (await projectsWithCounts(botId)).find((p) => p.name === name);
+      if (!project) throw new AdminWriteError(`项目「${name}」不存在`);
+      return (await createBackend(project.backend).listModels()).filter((m) => !m.hidden);
+    },
+
+    async setModelDefault(botId: string, name: string, model: string, effort?: ReasoningEffort): Promise<void> {
+      await executeWrite(botId, '🤖 设置默认模型', { kind: 'setModelDefault', project: name, model, effort });
     },
 
     async switchBackend(botId: string, projectName: string, backendId: string): Promise<void> {
