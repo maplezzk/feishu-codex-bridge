@@ -848,14 +848,19 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       mkdirSync(logDir, { recursive: true });
       watcher = watch(logDir, () => void pump());
     } catch {
-      /* 监听失败 → 退化为只有心跳；下一棒可换轮询 */
+      // 轮询仍会补送日志；保留心跳维持 SSE 连接。
     }
+    // macOS/Windows 的目录 watch 偶发漏掉文件追加事件。定期补读 offset，
+    // 让日志流最终能跟上，而不必等用户刷新页面。
+    const poller = setInterval(() => void pump(), 1000);
+    poller.unref();
     const heartbeat = setInterval(() => res.write(': ka\n\n'), 15_000);
 
     const cleanup = (): void => {
       if (closed) return;
       closed = true;
       clearInterval(heartbeat);
+      clearInterval(poller);
       try {
         watcher?.close();
       } catch {

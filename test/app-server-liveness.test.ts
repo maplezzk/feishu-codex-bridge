@@ -5,6 +5,7 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import { AppServerClient } from '../src/agent/codex-appserver/app-server-client';
 import { CodexAppServerBackend } from '../src/agent/codex-appserver/backend';
 import { shutdownResidentClients } from '../src/agent/codex-appserver/client-pool';
+import { resolveCodexBin } from '../src/agent/codex-appserver/locate';
 import { writeNodeExecutable } from './helpers/node-executable';
 
 // 一个最小的假 codex app-server：应答 initialize / thread/start，收到 turn/start
@@ -125,6 +126,9 @@ describe('app-server 进程死亡自愈（QW-6）', () => {
     const previous = process.env.CODEX_BIN;
     process.env.CODEX_BIN = retryBin;
     try {
+      // 前面的用例已经把 dir/codex 缓存在 locate 模块里。此处要明确切到
+      // retryBin，才会真的覆盖 initialize 失败后重试的路径。
+      expect(resolveCodexBin({ force: true })).toBe(retryBin);
       const backend = new CodexAppServerBackend();
       const thread = await backend.startThread({ cwd: retryDir });
       expect(thread.sessionId).toBe('th_test');
