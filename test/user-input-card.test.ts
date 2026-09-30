@@ -52,8 +52,16 @@ describe('Codex user-input cards', () => {
     const built = buildUserInputCard({ questions: [question({ isOther: true })], token: 'opaque-token' });
     const json = JSON.stringify(built);
     expect(json).toContain('Which colour should Codex use?');
-    expect(json).toContain('Blue — A calm blue tone');
-    expect(json).toContain('Red — A vivid red tone');
+    expect(json.split('Blue — A calm blue tone')).toHaveLength(2);
+    expect(json.split('Red — A vivid red tone')).toHaveLength(2);
+    expect(findByTag(built, 'markdown').map((node) => node.content)).toEqual([
+      '每题选择或填写答案后提交，自填内容优先。',
+      'Which colour should Codex use?',
+    ]);
+    expect(built.config).toMatchObject({ width_mode: 'default' });
+    expect(findByTag(built, 'column_set').some((row) =>
+      findByTag(row, 'select_static').length === 1 && findByTag(row, 'input').length === 1)).toBe(true);
+    expect(findByTag(built, 'input')[0]).toMatchObject({ input_type: 'text', placeholder: { content: '其他答案（可选）' } });
     expect(json).toContain(questionField(0));
     expect(json).toContain(customField(0));
     expect(json).toContain('"value":"0"');
@@ -71,13 +79,11 @@ describe('Codex user-input cards', () => {
     const built = buildUserInputCard({ questions, token: 't', locale: 'en' });
     const json = JSON.stringify(built);
     expect(json).toContain('Codex needs your answer');
-    expect(json).toContain('1. One');
-    expect(json).toContain('2. Two');
-    expect(json).toContain('3. Three');
     expect(json).toContain('First?');
     expect(json).toContain('Second?');
     expect(json).toContain('Third?');
     expect(findByTag(built, 'input')).toHaveLength(2);
+    expect(findByTag(built, 'input').every((node) => node.required === true)).toBe(true);
     expect(findByTag(built, 'select_static')).toHaveLength(1);
   });
 
