@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { acquireSingleInstanceLock, BridgeAlreadyRunningError } from '../src/core/single-instance';
 
 // ── helpers ─────────────────────────────────────────────────────────
@@ -127,17 +127,22 @@ const harnessDir = join(root, 'node_modules', '.cache', `fcb-si-test-${process.p
 const DRIVER = `'use strict';
 const { existsSync } = require('node:fs');
 const { acquireSingleInstanceLock } = require('./single-instance.cjs');
-const [, , lockFile, goFile] = process.argv;
+const [, , lockFile, goFile, doneFile] = process.argv;
 const sab = new Int32Array(new SharedArrayBuffer(4));
-const deadline = Date.now() + 10000;
+const deadline = Date.now() + 20000;
 while (!existsSync(goFile)) {
   if (Date.now() > deadline) { console.log('TIMEOUT'); process.exit(2); }
   Atomics.wait(sab, 0, 0, 5);
 }
 try {
-  acquireSingleInstanceLock('cli_race_app', lockFile);
+  const release = acquireSingleInstanceLock('cli_race_app', lockFile);
   console.log('ACQUIRED');
-  setTimeout(() => process.exit(0), 1500); // 持锁等兄弟进程探测完
+  // 父进程看到三个竞争者都被拒后才释放锁，避免 CI 调度延迟造成误判。
+  while (!existsSync(doneFile)) {
+    if (Date.now() > deadline) { console.log('TIMEOUT_WAITING_DONE'); process.exit(2); }
+    Atomics.wait(sab, 0, 0, 5);
+  }
+  release();
 } catch (err) {
   console.log('REJECTED:' + (err && err.name));
   process.exit(0);
@@ -169,9 +174,10 @@ describe('并发多进程抢锁', () => {
     const dir = mkdtempSync(join(tmpdir(), 'si-race-'));
     const lockFile = join(dir, 'processes.json');
     const goFile = join(dir, 'go');
+    const doneFile = join(dir, 'done');
     try {
       const children = Array.from({ length: 4 }, () =>
-        spawn(process.execPath, [join(harnessDir, 'driver.cjs'), lockFile, goFile], {
+        spawn(process.execPath, [join(harnessDir, 'driver.cjs'), lockFile, goFile, doneFile], {
           stdio: ['ignore', 'pipe', 'inherit'],
         }),
       );
@@ -180,15 +186,20 @@ describe('并发多进程抢锁', () => {
         c.stdout!.on('data', (d: Buffer) => (buf += d.toString()));
         return () => buf;
       });
+      const exits = children.map((c) => waitExit(c));
       await Promise.all(children.map((c) => new Promise((r) => c.once('spawn', r))));
       await new Promise((r) => setTimeout(r, 300)); // 都进入 go 轮询后再发令
       writeFileSync(goFile, 'go');
-      await Promise.all(children.map((c) => waitExit(c)));
+      await vi.waitFor(() => {
+        expect(outputs.map((f) => f()).filter((line) => line.includes('REJECTED:BridgeAlreadyRunningError'))).toHaveLength(3);
+      }, { timeout: 12_000 });
+      writeFileSync(doneFile, 'done');
+      await Promise.all(exits);
       const lines = outputs.map((f) => f().trim());
       expect(lines.filter((l) => l === 'ACQUIRED')).toHaveLength(1);
       expect(lines.filter((l) => l === 'REJECTED:BridgeAlreadyRunningError')).toHaveLength(3);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 20_000);
+  }, 30_000);
 });
