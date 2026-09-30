@@ -163,6 +163,7 @@ export type AgentEvent =
   // the run card's threshold gauge + the /context command. `contextWindow` is the
   // model's total window (null when codex doesn't report one → percent unknown).
   | { type: 'context_usage'; usedTokens: number; contextWindow: number | null }
+  | { type: 'context_compacting' }
   // codex compacted the thread's history (thread/compacted). Auto-compaction
   // surfaces a notice; a manual /compact is suppressed (see handle-message).
   | { type: 'context_compacted' }

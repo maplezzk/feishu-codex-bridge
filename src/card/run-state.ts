@@ -36,7 +36,7 @@ export interface ReasoningItem {
   text: string;
 }
 
-export type FooterStatus = 'thinking' | 'tool_running' | 'streaming' | 'retrying' | null;
+export type FooterStatus = 'thinking' | 'tool_running' | 'streaming' | 'retrying' | 'compacting' | null;
 export type Terminal = 'running' | 'done' | 'interrupted' | 'error' | 'idle_timeout';
 
 /** 自动重试的运行时状态：terminal 仍是 'running'（这一轮没结束），卡上显示进度。 */
@@ -209,9 +209,10 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
 
     case 'context_usage':
       return { ...state, usage: { used: evt.usedTokens, window: evt.contextWindow } };
-
-    // context_compacted is surfaced as a standalone notice by the run loop, not
-    // folded into the card — fall through to the no-op default.
+    case 'context_compacting':
+      return { ...state, reasoningActive: false, footer: 'compacting' };
+    case 'context_compacted':
+      return { ...state, footer: 'thinking' };
 
     case 'error':
       // willRetry: codex 瞬断后会自己重试 — NOT terminal. Flipping to the error
