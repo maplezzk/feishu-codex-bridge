@@ -94,10 +94,6 @@ export function createAsyncUserInputRequest(
   };
 }
 
-/** The normal upper bound for a remote question wait. */
-export const DEFAULT_USER_INPUT_TIMEOUT_MS = 30 * 60_000;
-/** Do not let malformed or future protocol values create an unbounded timer. */
-export const MAX_USER_INPUT_TIMEOUT_MS = DEFAULT_USER_INPUT_TIMEOUT_MS;
 const TOMBSTONE_TTL_MS = 5 * 60_000;
 const MAX_CUSTOM_TEXT_LENGTH = 1000;
 
@@ -120,7 +116,6 @@ const COPY: Record<UserInputLocale, {
   stale: string;
   noOwner: string;
   timeout: string;
-  timeoutReject: string;
   secret: string;
   malformed: string;
   sendFailed: string;
@@ -149,7 +144,6 @@ const COPY: Record<UserInputLocale, {
     stale: '这张提问卡已经失效，请等待新的提问卡。',
     noOwner: '提问没有可验证的发起人，出于安全原因不会发送提问卡。本次提问已结束，未提交回答。',
     timeout: '⏱️ 提问已超时，未收到完整回答。',
-    timeoutReject: 'user input timed out before a complete answer was received',
     secret: '检测到敏感提问，出于安全原因不会通过飞书发送。本次提问已拒绝，未提交回答。',
     malformed: '提问内容无效，未发送提问卡。本次提问已结束，未提交回答。',
     sendFailed: '提问卡发送失败，已结束这次等待，请回到本机重试。',
@@ -178,7 +172,6 @@ const COPY: Record<UserInputLocale, {
     stale: 'This question card has expired. Wait for a new question card.',
     noOwner: 'The question has no verifiable requester, so no card was sent. The question ended without an answer.',
     timeout: '⏱️ The question timed out before a complete answer was received.',
-    timeoutReject: 'user input timed out before a complete answer was received',
     secret: 'This question may contain sensitive information, so it will not be sent through Feishu. The question was rejected without an answer.',
     malformed: 'The question payload is invalid. No card was sent; the question ended without an answer.',
     sendFailed: 'The question card could not be sent. The wait has ended; retry from the local machine.',
@@ -326,7 +319,6 @@ interface ActiveRequest {
   phase: 'sending' | 'pending' | 'submitting' | 'terminal';
   messageId?: string;
   sendFinished: boolean;
-  timer?: ReturnType<typeof setTimeout>;
   unsubscribe?: () => void;
   terminalCard?: CardObject;
   answers?: UserInputAnswers;
@@ -368,13 +360,6 @@ function validQuestionSet(questions: unknown): questions is AgentUserInputQuesti
     ids.add(question.id);
   }
   return true;
-}
-
-function timeoutFor(request: AgentUserInputRequest): number {
-  const requested = request.autoResolutionMs;
-  if (requested === null || requested === undefined) return DEFAULT_USER_INPUT_TIMEOUT_MS;
-  if (!Number.isFinite(requested) || requested < 0) return DEFAULT_USER_INPUT_TIMEOUT_MS;
-  return Math.min(Math.floor(requested), MAX_USER_INPUT_TIMEOUT_MS);
 }
 
 function answerValues(value: unknown): string[] | undefined {
@@ -529,8 +514,6 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
   }
 
   function cleanup(state: ActiveRequest): void {
-    if (state.timer) clearTimeout(state.timer);
-    state.timer = undefined;
     try {
       state.unsubscribe?.();
     } catch (err) {
@@ -610,8 +593,6 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
   ): void {
     if (state.phase === 'terminal') return;
     state.phase = 'terminal';
-    if (state.timer) clearTimeout(state.timer);
-    state.timer = undefined;
     try {
       state.terminalCard = terminalCard(state, status, reason);
     } catch (err) {
@@ -635,14 +616,6 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
     }
     if (state.answerSubmitted) setTerminal(state, 'resolved', reason);
     else setTerminal(state, 'rejected', reason);
-  }
-
-  async function expire(state: ActiveRequest): Promise<void> {
-    if (state.phase === 'terminal' || state.respondInFlight || !isPending(state.request)) return;
-    const text = COPY[state.locale];
-    setTerminal(state, 'rejected', 'timeout');
-    await rejectRequest(state, text.timeoutReject);
-    await notify(state.scope, text.timeout);
   }
 
   async function handleSubmit(ctx: CardActionContext): Promise<void> {
@@ -721,7 +694,7 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
     await updateCard(state, submitting, 'update-submitting');
 
     // Updating the card yields to the callback network. A thread close,
-    // timeout, or server resolution can happen during that await; never send a
+    // or server resolution can happen during that await; never send a
     // response after such a transition.
     if (state.phase !== 'submitting' || !isPending(state.request)) {
       if (!isTerminal(state)) setTerminal(state, 'rejected', 'resolved');
@@ -795,9 +768,8 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
     } catch (err) {
       report(err, 'on-resolved');
     }
-    const timeoutTimer = setTimeout(() => { void expire(state); }, timeoutFor(request));
-    state.timer = timeoutTimer;
-    unrefTimer(timeoutTimer);
+    // A human answer has no bridge-imposed deadline. The request's lifecycle
+    // still closes the card on cancellation, server resolution or disconnect.
 
     let sent: { messageId: string };
     try {
