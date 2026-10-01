@@ -5,6 +5,7 @@ import { log } from '../core/logger';
 interface Message {
   root_id?: string;
   thread_id?: string;
+  upper_message_id?: string;
   sender?: { id?: string; id_type?: string; sender_type?: string };
 }
 
@@ -21,7 +22,7 @@ export async function notificationRecipients(
       const recipients = new Set(fallback);
       const collect = (item: Message) => {
         const sender = item.sender;
-        if (sender?.sender_type === 'user' && sender.id && (!sender.id_type || sender.id_type === 'open_id')) {
+        if (!item.upper_message_id && sender?.sender_type === 'user' && sender.id && (!sender.id_type || sender.id_type === 'open_id')) {
           recipients.add(sender.id);
         }
       };
@@ -32,7 +33,8 @@ export async function notificationRecipients(
       if (item.root_id && item.root_id !== scope.messageId) {
         const root = await channel.rawClient.im.v1.message.get({ path: { message_id: item.root_id } });
         if (root.code || !root.data?.items?.length) throw new Error('topic root lookup failed');
-        root.data.items.forEach(collect);
+        // A forwarded root may include original messages from another chat.
+        collect(root.data.items[0]!);
       }
       const seen = new Set<string>();
       let pageToken: string | undefined;

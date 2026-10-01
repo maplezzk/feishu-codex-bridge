@@ -7,9 +7,10 @@ function fixture() {
   let people = ['ou_A'];
   const reply = vi.fn(async () => ({}));
   const api = {
-    get: async ({ path }: any) => ({ code: 0, data: { items: [{ thread_id: 'omt_topic',
-      ...(path.message_id === 'om_root' ? { sender: { id: 'ou_root', sender_type: 'user' } } : { root_id: 'om_root' }),
-    }] } }),
+    get: async ({ path }: any) => ({ code: 0, data: { items: path.message_id === 'om_root' ? [
+      { thread_id: 'omt_topic', sender: { id: 'ou_root', sender_type: 'user' } },
+      { upper_message_id: 'om_root', sender: { id: 'ou_forwarded', sender_type: 'user' } },
+    ] : [{ thread_id: 'omt_topic', root_id: 'om_root' }] } }),
     list: async ({ params }: any) => ({ code: params.container_id === 'omt_topic' && params.container_id_type === 'thread' ? 0 : 400,
       data: params.page_token ? {
       items: people.map(id => ({ sender: { id, sender_type: 'user' } })), has_more: false,
@@ -48,6 +49,7 @@ describe('topic notification delivery', () => {
         expect(second.split(`<at id=${id}></at>`)).toHaveLength(2);
       }
       expect(second).not.toContain('cli_bot');
+      expect(second).not.toContain('ou_forwarded');
       expect(second).not.toContain('<at id=system>');
       await expect(sendCompletionReminderReply({ channel: f.channel,
         cfg: { accounts: { app: { id: 'cli_bot', secret: 'fixture', tenant: 'feishu' } },
