@@ -40,6 +40,7 @@ export interface UserInputCardOptions {
   token: string;
   /** Mention on the initial pending card only; updates do not notify again. */
   requesterOpenId?: string;
+  recipientOpenIds?: string[];
   locale?: UserInputLocale;
   status?: UserInputCardStatus;
   answers?: UserInputAnswers;
@@ -47,6 +48,7 @@ export interface UserInputCardOptions {
 }
 
 export interface UserInputServiceDeps {
+  recipients?: (scope: UserInputScope) => Promise<string[]>;
   send: (scope: UserInputScope, card: object) => Promise<{ messageId: string }>;
   update: (messageId: string, card: object) => Promise<boolean>;
   notify: (scope: UserInputScope, text: string) => Promise<unknown>;
@@ -247,7 +249,8 @@ export function buildUserInputCard(opts: UserInputCardOptions): CardObject {
   const status = opts.status ?? 'pending';
   const common: CardElement[] = [];
   if (status === 'pending') {
-    const mention = opts.requesterOpenId ? `<at id=${opts.requesterOpenId}></at> ` : '';
+    const recipients = opts.recipientOpenIds ?? (opts.requesterOpenId ? [opts.requesterOpenId] : []);
+    const mention = [...new Set(recipients)].map((id) => `<at id=${id}></at> `).join('');
     common.push(md(`${mention}${text.instructions}`));
   } else if (status === 'submitting') {
     common.push(md(text.submitting));
@@ -798,6 +801,15 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
 
     let sent: { messageId: string };
     try {
+      if (deps.recipients) {
+        const recipientOpenIds = await deps.recipients(state.scope);
+        if (!isPending(request) || state.phase === 'terminal') {
+          cleanup(state);
+          return;
+        }
+        state.card = buildUserInputCard({ questions: request.questions, token, locale,
+          requesterOpenId: scope.requesterOpenId, recipientOpenIds });
+      }
       sent = await deps.send(state.scope, state.card);
       if (!sent || typeof sent.messageId !== 'string' || sent.messageId.length === 0) {
         throw new Error('user-input send returned no messageId');

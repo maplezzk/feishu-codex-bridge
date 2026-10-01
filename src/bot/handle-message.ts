@@ -73,6 +73,7 @@ import {
 } from '../config/schema';
 import { CardDispatcher } from '../card/dispatcher';
 import { createAsyncUserInputRequest, createUserInputService } from '../card/user-input';
+import { notificationRecipients } from './notification-recipients';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
 import { RunRender } from '../card/run-render';
 import { finalMessageText, initialState, reduce, type RunState } from '../card/run-state';
@@ -2272,6 +2273,9 @@ export function createOrchestrator(
   // ── card actions ──────────────────────────────────────────────────
   const dispatcher = new CardDispatcher(channel, cfg);
   const userInputs = createUserInputService({
+    recipients: (scope) => notificationRecipients(channel, {
+      messageId: scope.replyToMessageId, inThread: scope.inThread, requesterOpenId: scope.requesterOpenId,
+    }),
     send: (scope, card) => sendManagedCard(channel, scope.chatId, card, scope.replyToMessageId, scope.inThread),
     update: (messageId, card) => updateManagedCard(channel, messageId, card),
     notify: (scope, text) => channel.send(scope.chatId, { text }, {
