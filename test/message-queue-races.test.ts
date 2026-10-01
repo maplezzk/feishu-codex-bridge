@@ -7,6 +7,7 @@ import type { AgentEvent, AgentInput } from '../src/agent/types';
 const fake = vi.hoisted(() => ({
   allowedUsers: undefined as string[] | undefined,
   groupMode: 'single' as 'single' | 'multi',
+  guestMode: undefined as 'qa' | undefined,
   backend: { capabilities: { steer: true }, id: 'codex', listModels: vi.fn(async () => []), resumeThread: vi.fn(), startThread: vi.fn() },
   voice: vi.fn(async (_channel: unknown, msg: NormalizedMessage) => ({ text: '语音正文', voice: { messageId: msg.messageId, text: '语音正文', transcribed: true } })),
   live: vi.fn(),
@@ -27,7 +28,7 @@ vi.mock('../src/core/logger', () => ({ log: fake.log, withTrace: (_ctx: unknown,
 vi.mock('../src/agent', async (original) => ({ ...await original<object>(), createBackend: () => fake.backend }));
 vi.mock('../src/project/registry', async (original) => ({
   ...await original<object>(),
-  getProjectByChatId: async () => ({ name: 'test', chatId: 'chat', cwd: '/test', groupMode: fake.groupMode, allowedUsers: fake.allowedUsers }),
+  getProjectByChatId: async () => ({ name: 'test', chatId: 'chat', cwd: '/test', groupMode: fake.groupMode, allowedUsers: fake.allowedUsers, mode: 'full', guestMode: fake.guestMode }),
 }));
 vi.mock('../src/bot/session-store', async (original) => ({
   ...await original<object>(),
@@ -123,6 +124,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   fake.groupMode = 'single';
   fake.allowedUsers = undefined;
+  fake.guestMode = undefined;
   fake.voice.mockReset().mockImplementation(async (_channel, msg) => voiceResult('语音正文', msg.messageId));
   fake.backend.capabilities.steer = true;
   fake.final.mockReset().mockResolvedValue(true);
@@ -331,6 +333,45 @@ describe('message queue lifecycle', () => {
     await until(() => expect(fake.questionSend.mock.calls.some(args =>
       JSON.stringify(args[2]).includes('<at id=collaborator></at>'))).toBe(true));
     run.turns[1]!.resolve();
+  });
+
+  it.each(['ordinary', 'goal'] as const)('keeps a split-tier %s question open after a guest reply and accepts another admin', async (kind) => {
+    fake.guestMode = 'qa';
+    const run = thread();
+    const steered: AgentInput[] = [];
+    run.t.steer.mockImplementation(async input => { steered.push(input); });
+    Object.assign(run.t, { runGoal: () => run.t.runStreamed({ text: 'goal' }), clearGoal: vi.fn(async () => undefined) });
+    fake.backend.startThread.mockResolvedValue(run.t);
+    fake.backend.resumeThread.mockResolvedValue(run.t);
+    const o = setup();
+    testConfig.preferences!.access!.admins = ['peer-admin'];
+    await o.onMessage(message(kind === 'goal' ? '/goal 确认仓库' : '确认仓库'));
+    await until(() => expect(run.consumed).toHaveLength(1));
+    run.emit({ type: 'user_input_async', threadId: 'host', turnId: 'turn-1', itemId: 'tier-question',
+      questions: [{ id: 'warehouse', header: '仓库', question: '是否继续核对海外仓？', isOther: true, isSecret: false,
+        options: [{ label: '继续', description: '' }] }],
+    });
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'async-user-input-opened', expect.anything()));
+    const card = fake.questionSend.mock.calls.find(args => JSON.stringify(args[2]).includes('codex_user_input'))![2];
+    function nodes(v: any): any[] { return !v || typeof v !== 'object' ? [] : [v, ...Object.values(v).flatMap(nodes)]; }
+    const all = nodes(card), callback = all.find(node => node.a === 'codex.question.submit');
+    const select = all.find(node => node.tag === 'select_static');
+    const reply = (actor: string) => ({ chatId: 'chat', messageId: 'question-card', operator: { openId: actor },
+      action: { value: callback, tag: 'button' }, raw: { action: { form_value: { [select.name]: '0' } } },
+    });
+    if (kind === 'ordinary') {
+      run.turns[0]!.resolve();
+      await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
+    }
+    await o.dispatcher.handle(reply('collaborator') as never);
+    expect(JSON.stringify(fake.send.mock.calls)).toContain('你没有提交这张提问卡答案的权限');
+    expect([...run.consumed.slice(1), ...steered]).toEqual([]);
+    await o.dispatcher.handle(reply('peer-admin') as never);
+    await until(() => expect([...run.consumed.slice(1), ...steered].map(input => input.text))
+      .toEqual([expect.stringContaining('是否继续核对海外仓？\n回答：继续')]));
+    expect(JSON.stringify(fake.questionUpdate.mock.calls)).toContain('是否继续核对海外仓？');
+    if (kind === 'goal') run.emit({ type: 'goal_update', status: 'complete', objective: '确认仓库', tokensUsed: 1, timeUsedSeconds: 1, tokenBudget: null });
+    run.turns.at(-1)!.resolve();
   });
 
   it('starts the follow-up when steer rejects after its original consumer has finished', async () => {

@@ -26,6 +26,8 @@ export interface UserInputScope {
   replyToMessageId?: string;
   inThread: boolean;
   requesterOpenId?: string;
+  /** Bound conversation, including any permission-tier namespace. */
+  sessionKey?: string;
   locale?: UserInputLocale;
 }
 
