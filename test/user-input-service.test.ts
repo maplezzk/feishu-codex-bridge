@@ -308,15 +308,16 @@ describe('Codex user-input service', () => {
     expect(t.notices.at(-1)?.text).toMatch(/发起人|requester/);
   });
 
-  it('rejects on the bounded timeout and does not fabricate answers', async () => {
+  it('keeps an unanswered card valid beyond both a suggested deadline and a day', async () => {
     const t = setup({ autoResolutionMs: 50 });
     await t.service.open(t.harness.request, t.scope);
-    await vi.advanceTimersByTimeAsync(49);
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
     expect(t.harness.reject).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-    expect(t.harness.reject).toHaveBeenCalledOnce();
     expect(t.harness.respond).not.toHaveBeenCalled();
-    expect(JSON.stringify(t.updates.at(-1)?.card)).toContain('超时');
+    expect(t.harness.request.isPending()).toBe(true);
+    await click(t, { [questionField(0)]: '0' });
+    expect(t.harness.request.isPending()).toBe(false);
+    expect(JSON.stringify(t.updates.at(-1)?.card)).toContain('已收到回答');
   });
 
   it('rejects the request and notifies when sending fails', async () => {
@@ -354,6 +355,7 @@ describe('Codex user-input service', () => {
     }, submit);
     await t.service.open(request, t.scope);
     await t.service.closeThread('thread-1', 'run-ended');
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
     expect(request.isPending()).toBe(true);
     await t.service.closeAll('shutdown');
     expect(request.isPending()).toBe(false);

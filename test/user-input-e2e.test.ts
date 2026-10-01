@@ -4,6 +4,7 @@ import type { AppConfig } from '../src/config/schema';
 import { CardDispatcher } from '../src/card/dispatcher';
 import { createUserInputService } from '../src/card/user-input';
 import { CodexAppServerBackend } from '../src/agent/codex-appserver/backend';
+import { withIdleTimeout } from '../src/bot/watchdog';
 
 const wire = vi.hoisted(() => ({ writes: [] as Record<string, any>[] }));
 vi.mock('../src/agent/codex-appserver/locate', () => ({ resolveCodexBin: () => 'fake-codex' }));
@@ -77,8 +78,9 @@ describe('Codex question round trip through Feishu forms', () => {
     service.register(dispatcher);
     const events: string[] = [];
     const run = thread.runStreamed({ text: 'Ask me two questions' });
+    let timedOut = false;
     const consume = (async () => {
-      for await (const event of run.events) {
+      for await (const event of withIdleTimeout(run.events, 120_000, () => { timedOut = true; }, undefined, run.lastActivity)) {
         events.push(event.type);
         if (event.type === 'user_input_request') await service.open(event.request, {
           chatId: 'chat-e2e', inThread: true, replyToMessageId: 'run-message', requesterOpenId: 'owner-e2e',
@@ -94,6 +96,12 @@ describe('Codex question round trip through Feishu forms', () => {
       const input = cardNodes.find((node) => node.tag === 'input')!;
       expect(callback).toBeDefined();
       const formValue = { [select.name]: select.options[0].value, [input.name]: 'minimal' };
+      vi.useFakeTimers();
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+      expect(timedOut).toBe(false);
+      expect(wire.writes.filter((message) => message.id === 'ask-42')).toEqual([]);
+      expect(update.mock.calls.some(args => JSON.stringify(args).includes('超时'))).toBe(false);
+      vi.useRealTimers();
       const action = (openId: string) => ({
         chatId: 'chat-e2e', messageId: 'question-message', operator: { openId },
         action: { value: callback, tag: 'button' }, raw: { action: { form_value: formValue } },
@@ -119,6 +127,7 @@ describe('Codex question round trip through Feishu forms', () => {
       expect(update).toHaveBeenCalled();
       expect(notify).toHaveBeenCalled();
     } finally {
+      vi.useRealTimers();
       await service.closeThread(thread.sessionId, 'test-ended');
       await thread.close();
     }
