@@ -61,6 +61,7 @@ function nodes(value: unknown): Record<string, any>[] {
 describe('Codex question round trip through Feishu forms', () => {
   it('mentions the requester, accepts a permitted collaborator, and continues the original turn once', async () => {
     wire.writes.length = 0;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     const thread = await new CodexAppServerBackend().startThread({ cwd: process.cwd(), mode: 'full' });
     const channel = {} as LarkChannel;
     const dispatcher = new CardDispatcher(channel, {} as AppConfig);
@@ -96,7 +97,6 @@ describe('Codex question round trip through Feishu forms', () => {
       const input = cardNodes.find((node) => node.tag === 'input')!;
       expect(callback).toBeDefined();
       const formValue = { [select.name]: select.options[0].value, [input.name]: 'minimal' };
-      vi.useFakeTimers();
       await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
       expect(timedOut).toBe(false);
       expect(wire.writes.filter((message) => message.id === 'ask-42')).toEqual([]);
