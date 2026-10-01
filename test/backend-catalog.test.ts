@@ -14,15 +14,17 @@ import {
 import { backendIds, createBackend } from '../src/agent';
 import {
   BackendNotInstalledError,
+  isBackendEntryInstalled,
   isBackendDepInstalled,
   loadBackendDep,
+  resolveExternalCliBin,
 } from '../src/agent/backend-loader';
 import { buildInstallCommand, stripVersion } from '../src/agent/installer';
 import { paths } from '../src/config/paths';
 
 /**
  * 棒A 地基：catalog↔REGISTRY 配对、按需加载器三路径、installer 命令构建（不真跑
- * npm）、智能默认规则、ensureAnyAgent 放行。当前内置后端仅 codex（claude 系已移除）。
+ * npm）、智能默认规则、ensureAnyAgent 放行。当前注册 Codex、Claude 和 Pi；默认仍是 Codex。
  */
 
 describe('catalog ↔ REGISTRY 配对（防漏注册）', () => {
@@ -44,17 +46,58 @@ describe('catalog ↔ REGISTRY 配对（防漏注册）', () => {
     }
   });
 
-  it('唯一内置后端 codex 是 external-cli（bridge 不负责装，doctor 探 PATH）', () => {
+  it('Codex 与 Pi 是 external-cli（bridge 不负责装，doctor 探 PATH）', () => {
     expect(catalogById('codex-appserver')?.dep.kind).toBe('external-cli');
+    expect(catalogById('pi-rpc')?.dep.kind).toBe('external-cli');
+    expect(catalogById('pi-rpc')?.dep).toMatchObject({
+      pkg: '@earendil-works/pi-coding-agent',
+      binName: 'pi',
+      envBinKey: 'PI_BIN',
+    });
   });
 
-  it('external-cli（codex）不可一键下载（isInstallable=false）', () => {
+  it('external-cli（codex / pi）不可一键下载（isInstallable=false）', () => {
     expect(isInstallable(catalogById('codex-appserver')!)).toBe(false);
+    expect(isInstallable(catalogById('pi-rpc')!)).toBe(false);
   });
 
-  it('catalogByFamily 分组：codex 组 / claude 组各 1 条', () => {
+  it('Pi external-cli 按 PI_BIN / bridge 私装 .bin 判定，显式坏路径不回退 PATH', () => {
+    const entry = catalogById('pi-rpc')!;
+    const previousBackendsDir = paths.backendsDir;
+    const isolatedDir = mkdtempSync(join(tmpdir(), 'pi-bin-'));
+    const previousPiBin = process.env.PI_BIN;
+    const previousPath = process.env.PATH;
+    paths.backendsDir = isolatedDir;
+    const privateBin = join(isolatedDir, 'node_modules', '.bin', 'pi');
+    try {
+      mkdirSync(join(isolatedDir, 'node_modules', '.bin'), { recursive: true });
+      writeFileSync(privateBin, 'fixture');
+
+      process.env.PI_BIN = privateBin;
+      expect(resolveExternalCliBin(entry.dep)).toBe(privateBin);
+      expect(isBackendEntryInstalled(entry)).toBe(true);
+
+      process.env.PI_BIN = join(paths.backendsDir, 'missing-pi');
+      expect(resolveExternalCliBin(entry.dep)).toBeNull();
+      expect(isBackendEntryInstalled(entry)).toBe(false);
+
+      delete process.env.PI_BIN;
+      process.env.PATH = '';
+      expect(resolveExternalCliBin(entry.dep)).toBe(privateBin);
+    } finally {
+      if (previousPiBin === undefined) delete process.env.PI_BIN;
+      else process.env.PI_BIN = previousPiBin;
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      paths.backendsDir = previousBackendsDir;
+      rmSync(isolatedDir, { recursive: true, force: true });
+    }
+  });
+
+  it('catalogByFamily 分组：codex / claude / pi 各 1 条', () => {
     expect(catalogByFamily('codex').map((e) => e.id)).toEqual(['codex-appserver']);
     expect(catalogByFamily('claude').map((e) => e.id)).toEqual(['claude-agent']);
+    expect(catalogByFamily('pi').map((e) => e.id)).toEqual(['pi-rpc']);
   });
 });
 
@@ -62,7 +105,7 @@ describe('projectCreatableBackends —— 飞书新建/绑定卡的「可选后�
   const ids = (mode: 'qa' | 'write' | 'full', inst: (e: { id: string }) => boolean) =>
     projectCreatableBackends(mode, inst).map((e) => e.id);
 
-  it('codex 是默认基线 → 即便都「未下载」也始终可选；claude-agent 未装则不出现', () => {
+  it('codex 是默认基线 → 即便都「未下载」也始终可选；其它后端未装则不出现', () => {
     expect(ids('full', () => false)).toEqual(['codex-appserver']);
   });
 
@@ -70,24 +113,27 @@ describe('projectCreatableBackends —— 飞书新建/绑定卡的「可选后�
     expect(ids('qa', () => true)).toEqual(['codex-appserver', 'claude-agent']);
   });
 
-  it('任意权限档：codex 恒在；claude-agent 仅在「已装」时出现（按下载态过滤）', () => {
+  it('权限档过滤：Pi 只在 full 出现；其它后端按「已装」过滤', () => {
+    expect(ids('qa', () => true)).toEqual(['codex-appserver', 'claude-agent']);
+    expect(ids('write', () => true)).toEqual(['codex-appserver', 'claude-agent']);
+    expect(ids('full', () => true)).toEqual(['codex-appserver', 'claude-agent', 'pi-rpc']);
     for (const mode of ['qa', 'write', 'full'] as const) {
-      expect(ids(mode, () => true)).toEqual(['codex-appserver', 'claude-agent']);
       expect(ids(mode, () => false)).toEqual(['codex-appserver']);
     }
   });
 });
 
-describe('可见 catalog 与注册派生（codex + claude-agent）', () => {
-  it('visibleCatalog() 含 codex 与 claude-agent（Web 后端页 / 体检页 / picker 数据源）', () => {
-    expect(visibleCatalog().map((e) => e.id)).toEqual(['codex-appserver', 'claude-agent']);
+describe('可见 catalog 与注册派生（codex + claude-agent + pi-rpc）', () => {
+  it('visibleCatalog() 含 codex、claude-agent 与 pi-rpc（Web 后端页 / 体检页 / picker 数据源）', () => {
+    expect(visibleCatalog().map((e) => e.id)).toEqual(['codex-appserver', 'claude-agent', 'pi-rpc']);
   });
 
-  it('catalogBackendIds 与 REGISTRY 配对不破（两条）', () => {
-    expect([...catalogBackendIds()].sort()).toEqual(['claude-agent', 'codex-appserver']);
-    // 工厂存在：两个 id 都能构造出实例。
+  it('catalogBackendIds 与 REGISTRY 配对不破（三条）', () => {
+    expect([...catalogBackendIds()].sort()).toEqual(['claude-agent', 'codex-appserver', 'pi-rpc']);
+    // 工厂存在：三个 id 都能构造出实例。
     expect(createBackend('codex-appserver').id).toBe('codex-appserver');
     expect(createBackend('claude-agent').id).toBe('claude-agent');
+    expect(createBackend('pi-rpc').id).toBe('pi-rpc');
   });
 
   it('createBackend 未注册 id 仍抛错（错误信息含 codex-appserver）', () => {
@@ -173,7 +219,7 @@ describe('installer：命令构建（不真跑 npm）', () => {
   });
 });
 
-describe('按需依赖装没装的两态（isBackendDepInstalled —— 通用机制，codex 系内置后端不用但基础设施保留）', () => {
+describe('按需依赖装没装的两态（isBackendDepInstalled —— 通用机制，external-cli 后端不用但基础设施保留）', () => {
   it('bridge 自身依赖可解析 → true；两处都没有的幽灵包 → false', () => {
     // 已装样例用仍在的 bridge 自身依赖（cross-spawn），不耦合已删后端的包名。
     expect(isBackendDepInstalled('cross-spawn')).toBe(true);

@@ -1,12 +1,13 @@
 import { createRequire } from 'node:module';
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { paths } from '../config/paths';
-import type { BackendCatalogEntry } from './catalog';
+import { spawnProcessSync } from '../platform/spawn';
+import type { BackendCatalogEntry, BackendDep } from './catalog';
 
 /**
- * 按需后端依赖的加载器（npm-ondemand 包，库类 / bin 类；通用基础设施，当前内置后端未用）。
+ * 后端依赖的加载器（npm-ondemand 包，库类 / bin 类；并提供 external-cli 的通用查找）。
  *
  * 真机验证过的解析方案（design/backend-catalog-ondemand.md §2.1，实验 C/D/F）：
  *   ① 先试 bridge 自身的 node_modules —— 直接 `await import(pkg)`（bare specifier）。
@@ -116,16 +117,68 @@ export function isBackendBinInstalled(binName: string): boolean {
   return backendsBinPath(binName) !== null;
 }
 
+const IS_WIN = process.platform === 'win32';
+
 /**
- * 一条 npm 管理的后端是否已装（catalog/doctor/detect 的统一判定，按 dep 形态分派）：
+ * 查找由 catalog 声明的外部 CLI。这里故意不依赖任何具体后端的 locate.ts：
+ * backend-loader 会被项目选择器和管理页调用，而具体后端也可能反过来使用本模块，
+ * 直接互相 import 会把探测层变成循环依赖。
+ *
+ * 顺序与 pi 的用户预期一致：环境变量显式覆盖 → PATH → bridge 私装目录的 .bin。
+ * Codex 没有 binName，因此仍走原有 doctor/locate 路径，不改变 Codex 行为。
+ */
+export function resolveExternalCliBin(dep: Pick<BackendDep, 'binName' | 'envBinKey'>): string | null {
+  const { binName, envBinKey } = dep;
+  if (!binName) return null;
+
+  const explicit = envBinKey ? process.env[envBinKey]?.trim() : undefined;
+  // 与具体后端 locator 的语义保持一致：显式指定了环境变量就只认这一条，
+  // 即使路径失效也不能静默换到 PATH 上的另一个 CLI。
+  if (explicit) return existsSync(explicit) ? explicit : null;
+
+  const onPath = whichExternalBin(binName);
+  if (onPath) return onPath;
+
+  return (
+    executableCandidates(join(paths.backendsDir, 'node_modules', '.bin'), binName).find((p) => existsSync(p)) ?? null
+  );
+}
+
+function executableCandidates(dir: string, name: string): string[] {
+  const exact = join(dir, name);
+  if (!IS_WIN || extname(name)) return [exact];
+  const exts = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
+    .split(';')
+    .map((part) => part.trim().toLowerCase())
+    .filter(Boolean);
+  return [exact, ...exts.map((extension) => `${exact}${extension}`)];
+}
+
+function whichExternalBin(name: string): string | null {
+  try {
+    const result = spawnProcessSync(IS_WIN ? 'where' : 'which', [name], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (result.status !== 0 || typeof result.stdout !== 'string') return null;
+    const first = result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    return first && existsSync(first) ? first : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 一条后端是否已装（catalog/doctor/detect 的统一判定，按 dep 形态分派）：
  *   bin 类（dep.binName）—— 查 node_modules/.bin（被 spawn 的可执行）。
  *   库类（仅 dep.pkg）—— 查 require.resolve（被 import 的库）。
- *   external-cli（codex）—— 不归此判（走 PATH，由 doctor/locate 负责）→ false。
+ *   external-cli（无 binName 的 codex）—— 不归此判（走 doctor/locate）→ false；
+ *   带 binName 的外部 CLI（例如 pi）—— 查环境变量、PATH 与 bridge 私装 .bin。
  * 绝不抛错。
  */
 export function isBackendEntryInstalled(entry: BackendCatalogEntry): boolean {
   const { kind, binName, pkg } = entry.dep;
-  if (kind === 'external-cli') return false;
+  if (kind === 'external-cli') return resolveExternalCliBin(entry.dep) !== null;
   if (binName) return isBackendBinInstalled(binName);
   return pkg ? isBackendDepInstalled(pkg) : false;
 }
