@@ -3,6 +3,7 @@ import type { CompletionReminderOutcome } from '../config/schema';
 /** Payload inputs for the extra Feishu reply emitted after a run card settles. */
 export interface CompletionReminderPost {
   requesterOpenId: string;
+  recipientOpenIds?: string[];
   outcome: Extract<CompletionReminderOutcome, 'done' | 'error' | 'idle_timeout'>;
   elapsedMs: number;
   /** Short, user-authored task summary. Empty/whitespace falls back to “本轮任务”. */
@@ -25,7 +26,7 @@ export function formatCompletionElapsed(elapsedMs: number): string {
 }
 
 /**
- * Build a native Feishu `post` body. The requester is a structured `at` node,
+ * Build a native Feishu `post` body. Recipients are structured `at` nodes,
  * not markdown text, so this extra reply enters Feishu's real mention/message
  * notification path. The returned value is ready for `im.v1.message.reply`'s
  * `content` field.
@@ -50,7 +51,8 @@ export function buildCompletionReminderContent(input: CompletionReminderPost): s
       title: '',
       content: [
         [
-          { tag: 'at', user_id: input.requesterOpenId },
+          ...[...new Set(input.recipientOpenIds ?? [input.requesterOpenId])]
+            .map((user_id) => ({ tag: 'at', user_id })),
           { tag: 'text', text: headline },
         ],
         [{ tag: 'text', text: detail }],

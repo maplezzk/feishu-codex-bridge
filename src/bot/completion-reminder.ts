@@ -7,6 +7,7 @@ import {
 } from '../config/schema';
 import { log } from '../core/logger';
 import { withCardApiTimeout } from '../card/run-card-stream';
+import { notificationRecipients } from './notification-recipients';
 
 export interface CompletionReminderReplyInput {
   cardMsgId: string;
@@ -60,6 +61,9 @@ export async function sendCompletionReminderReply(
 
   const content = buildCompletionReminderContent({
     requesterOpenId: input.requesterOpenId,
+    recipientOpenIds: await notificationRecipients(deps.channel, {
+      messageId: input.cardMsgId, inThread: input.replyInThread, requesterOpenId: input.requesterOpenId,
+    }),
     outcome: input.outcome,
     elapsedMs,
     summary: input.summary,
