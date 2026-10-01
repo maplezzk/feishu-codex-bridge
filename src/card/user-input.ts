@@ -36,6 +36,8 @@ export type UserInputCardStatus = 'pending' | 'submitting' | 'resolved' | 'rejec
 export interface UserInputCardOptions {
   questions: AgentUserInputQuestion[];
   token: string;
+  /** Mention on the initial pending card only; updates do not notify again. */
+  requesterOpenId?: string;
   locale?: UserInputLocale;
   status?: UserInputCardStatus;
   answers?: UserInputAnswers;
@@ -46,6 +48,8 @@ export interface UserInputServiceDeps {
   send: (scope: UserInputScope, card: object) => Promise<{ messageId: string }>;
   update: (messageId: string, card: object) => Promise<boolean>;
   notify: (scope: UserInputScope, text: string) => Promise<unknown>;
+  /** Current project access; chat/message binding is checked by the service. */
+  canSubmit?: (scope: UserInputScope, openId: string) => boolean | Promise<boolean>;
   onError?: (err: unknown, phase: string) => void;
 }
 
@@ -59,7 +63,7 @@ export interface UserInputService {
 /** Async input has no outstanding RPC: deliver its answer as a new user input. */
 export function createAsyncUserInputRequest(
   event: { threadId: string; turnId: string; itemId: string; questions: AgentUserInputQuestion[] },
-  submit: (text: string) => Promise<void>,
+  submit: (text: string, responderId?: string) => Promise<void>,
 ): AgentUserInputRequest {
   let pending = true;
   const listeners = new Set<(reason: string) => void>();
@@ -72,10 +76,10 @@ export function createAsyncUserInputRequest(
   return {
     ...event, requestId: event.itemId, persistsAfterTurn: true,
     isPending: () => pending,
-    respond: async (answers) => {
+    respond: async (answers, responderId) => {
       finish('responded');
       const text = event.questions.map((q) => `${q.question}\n回答：${answers[q.id]!.answers.join('、')}`).join('\n\n');
-      await submit(`用户已回答你的提问：\n\n${text}`);
+      await submit(`用户已回答你的提问：\n\n${text}`, responderId);
     },
     reject: async (reason) => { finish(reason); },
     onResolved: (listener) => {
@@ -102,8 +106,10 @@ const COPY: Record<UserInputLocale, {
   submit: string;
   submitting: string;
   resolved: string;
+  answer: string;
   invalid: string;
   unauthorized: string;
+  permissionCheckFailed: string;
   wrongChat: string;
   wrongMessage: string;
   duplicate: string;
@@ -129,8 +135,10 @@ const COPY: Record<UserInputLocale, {
     submit: '✅ 提交回答',
     submitting: '⏳ 正在提交回答…',
     resolved: '✅ 已收到回答，提问已关闭。',
+    answer: '回答',
     invalid: '回答不完整或包含无效选项，请检查后重新提交。',
-    unauthorized: '这张提问卡只接受发起人的回答。',
+    unauthorized: '你没有提交这张提问卡答案的权限。',
+    permissionCheckFailed: '暂时无法验证你的权限，请稍后再试。',
     wrongChat: '提问卡所属会话不匹配，已忽略这次操作。',
     wrongMessage: '这不是当前提问卡，已忽略这次操作。',
     duplicate: '回答正在提交，请不要重复点击。',
@@ -156,8 +164,10 @@ const COPY: Record<UserInputLocale, {
     submit: '✅ Submit answer',
     submitting: '⏳ Submitting answer…',
     resolved: '✅ Answer received; this question is closed.',
+    answer: 'Answer',
     invalid: 'The answer is incomplete or contains an invalid option. Check it and submit again.',
-    unauthorized: 'Only the person who asked this question may answer it.',
+    unauthorized: 'You do not have permission to answer this question.',
+    permissionCheckFailed: 'Your access could not be checked. Please try again later.',
     wrongChat: 'This question belongs to another chat. The action was ignored.',
     wrongMessage: 'This is not the current question card. The action was ignored.',
     duplicate: 'The answer is being submitted. Please do not click again.',
@@ -203,12 +213,13 @@ function optionDisplay(option: { label: string; description: string }): string {
 function answerLines(
   questions: AgentUserInputQuestion[],
   answers: UserInputAnswers | undefined,
+  locale: UserInputLocale,
 ): string[] {
   if (!answers) return [];
   return questions.flatMap((question) => {
     const value = answers[question.id]?.answers;
     if (!value?.length) return [];
-    return [`**${question.header || question.id}**：${value.join('、')}`];
+    return [question.question, `${COPY[locale].answer}：${value.join('、')}`];
   });
 }
 
@@ -234,13 +245,14 @@ export function buildUserInputCard(opts: UserInputCardOptions): CardObject {
   const status = opts.status ?? 'pending';
   const common: CardElement[] = [];
   if (status === 'pending') {
-    common.push(md(text.instructions));
+    const mention = opts.requesterOpenId ? `<at id=${opts.requesterOpenId}></at> ` : '';
+    common.push(md(`${mention}${text.instructions}`));
   } else if (status === 'submitting') {
     common.push(md(text.submitting));
   } else if (status === 'resolved') {
     common.push(md(text.resolved));
-    const lines = answerLines(opts.questions, opts.answers);
-    if (lines.length) common.push(md(lines.join('\n')));
+    const lines = answerLines(opts.questions, opts.answers, locale);
+    common.push(...lines.map(line => md(line)));
   } else if (status === 'failed') {
     common.push(md(`❌ ${opts.reason ?? text.respondFailed}`));
   } else {
@@ -551,7 +563,9 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
     // SDK's callback deduplication otherwise drops the user's next attempt for
     // the same form value.
     if (state.phase === 'pending') {
-      await updateCard(state, state.card, 'update-invalid');
+      await updateCard(state, buildUserInputCard({
+        questions: state.questions, token: state.token, locale: state.locale,
+      }), 'update-invalid');
       if (state.phase === 'pending' && !isPending(state.request)) setTerminal(state, 'rejected', 'resolved');
     }
   }
@@ -650,7 +664,7 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
     const locale = state.locale;
     const text = COPY[locale];
     const openId = eventOpenId(ctx);
-    if (!state.scope.requesterOpenId || openId !== state.scope.requesterOpenId) {
+    if (!openId) {
       await notify(state.scope, text.unauthorized);
       return;
     }
@@ -662,6 +676,18 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
       await notify(state.scope, text.wrongMessage);
       return;
     }
+    try {
+      if (deps.canSubmit && !await deps.canSubmit(state.scope, openId)) {
+        await notify(state.scope, text.unauthorized);
+        return;
+      }
+    } catch (err) {
+      report(err, 'check-submit-access');
+      await notify(state.scope, text.permissionCheckFailed);
+      await refreshPendingCard(state);
+      return;
+    }
+    // Permission lookup can await: recheck the live request before claiming it.
     if (state.phase === 'submitting') {
       await notify(state.scope, text.duplicate);
       return;
@@ -700,7 +726,7 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
     state.answerSubmitted = true;
     state.respondInFlight = true;
     try {
-      await state.request.respond(parsed.answers);
+      await state.request.respond(parsed.answers, openId);
       state.respondInFlight = false;
       if (!isTerminal(state)) {
         setTerminal(state, 'resolved', 'responded');
@@ -749,7 +775,7 @@ export function createUserInputService(deps: UserInputServiceDeps): UserInputSer
       scope: { ...scope, locale },
       locale,
       questions: request.questions,
-      card: buildUserInputCard({ questions: request.questions, token, locale }),
+      card: buildUserInputCard({ questions: request.questions, token, locale, requesterOpenId: scope.requesterOpenId }),
       phase: 'sending',
       sendFinished: false,
       answerSubmitted: false,

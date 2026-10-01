@@ -5,6 +5,7 @@ import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import type { AgentEvent, AgentInput } from '../src/agent/types';
 
 const fake = vi.hoisted(() => ({
+  allowedUsers: undefined as string[] | undefined,
   groupMode: 'single' as 'single' | 'multi',
   backend: { capabilities: { steer: true }, id: 'codex', listModels: vi.fn(async () => []), resumeThread: vi.fn(), startThread: vi.fn() },
   voice: vi.fn(async (_channel: unknown, msg: NormalizedMessage) => ({ text: '语音正文', voice: { messageId: msg.messageId, text: '语音正文', transcribed: true } })),
@@ -26,7 +27,7 @@ vi.mock('../src/core/logger', () => ({ log: fake.log, withTrace: (_ctx: unknown,
 vi.mock('../src/agent', async (original) => ({ ...await original<object>(), createBackend: () => fake.backend }));
 vi.mock('../src/project/registry', async (original) => ({
   ...await original<object>(),
-  getProjectByChatId: async () => ({ name: 'test', chatId: 'chat', cwd: '/test', groupMode: fake.groupMode }),
+  getProjectByChatId: async () => ({ name: 'test', chatId: 'chat', cwd: '/test', groupMode: fake.groupMode, allowedUsers: fake.allowedUsers }),
 }));
 vi.mock('../src/bot/session-store', async (original) => ({
   ...await original<object>(),
@@ -121,6 +122,7 @@ function setup(policy: 'steer' | 'queue' = 'steer', idleSeconds?: number) {
 beforeEach(() => {
   vi.clearAllMocks();
   fake.groupMode = 'single';
+  fake.allowedUsers = undefined;
   fake.voice.mockReset().mockImplementation(async (_channel, msg) => voiceResult('语音正文', msg.messageId));
   fake.backend.capabilities.steer = true;
   fake.final.mockReset().mockResolvedValue(true);
@@ -266,7 +268,7 @@ describe('watchdog configuration hot reload', () => {
 });
 
 describe('message queue lifecycle', () => {
-  it('adopts a new goal topic before opening its first async question and steers the owner answer', async () => {
+  it('adopts a new goal topic before opening its first async question and steers a collaborator answer', async () => {
     const run = thread();
     Object.assign(run.t, { runGoal: () => run.t.runStreamed({ text: 'goal' }), clearGoal: vi.fn(async () => undefined) });
     fake.backend.startThread.mockResolvedValue(run.t);
@@ -281,9 +283,10 @@ describe('message queue lifecycle', () => {
     expect(fake.createCard).toHaveBeenCalled();
     const card = fake.questionSend.mock.calls.find((args) => JSON.stringify(args[2]).includes('codex_user_input'))![2];
     function nodes(v: any): any[] { return !v || typeof v !== 'object' ? [] : [v, ...Object.values(v).flatMap(nodes)]; }
+    expect(JSON.stringify(card)).toContain('<at id=owner></at>');
     const all = nodes(card), callback = all.find((node) => node.a === 'codex.question.submit');
     const select = all.find((node) => node.tag === 'select_static');
-    await o.dispatcher.handle({ chatId: 'chat', messageId: 'question-card', operator: { openId: 'owner' },
+    await o.dispatcher.handle({ chatId: 'chat', messageId: 'question-card', operator: { openId: 'collaborator' },
       action: { value: callback, tag: 'button' }, raw: { action: { form_value: { [select.name]: '0' } } },
     } as never);
     expect(run.t.steer).toHaveBeenCalledWith({ text: expect.stringContaining('是否继续？\n回答：继续') }, 'turn-1');
@@ -291,11 +294,12 @@ describe('message queue lifecycle', () => {
     run.turns[0]!.resolve();
   });
 
-  it('keeps an async question after turn completion and delivers the owner answer once in the same session', async () => {
+  it('keeps an async question after turn completion and delivers a collaborator answer once in the same session', async () => {
+    fake.allowedUsers = ['initiator', 'collaborator'];
     const run = thread();
     fake.backend.resumeThread.mockResolvedValue(run.t);
     const o = setup();
-    await o.onMessage(message('测试一下提问功能，随便提问我一下'));
+    await o.onMessage({ ...message('测试一下提问功能，随便提问我一下'), senderId: 'initiator' });
     await until(() => expect(run.consumed).toHaveLength(1));
     run.emit({ type: 'user_input_async', threadId: 'host', turnId: 'turn-1', itemId: 'async-1',
       questions: [{ id: '0', header: 'Q1', question: '希望用什么风格？', isOther: true, isSecret: false,
@@ -304,6 +308,7 @@ describe('message queue lifecycle', () => {
     await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'async-user-input-opened', expect.anything()));
     const card = fake.questionSend.mock.calls.find((args) => JSON.stringify(args[2]).includes('codex_user_input'))![2];
     function nodes(v: any): any[] { return !v || typeof v !== 'object' ? [] : [v, ...Object.values(v).flatMap(nodes)]; }
+    expect(JSON.stringify(card)).toContain('<at id=initiator></at>');
     const all = nodes(card);
     const callback = all.find((node) => node.a === 'codex.question.submit');
     const select = all.find((node) => node.tag === 'select_static');
@@ -312,13 +317,19 @@ describe('message queue lifecycle', () => {
     });
     run.turns[0]!.resolve();
     await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
+    fake.allowedUsers = ['collaborator']; // The original initiator lost access after posting the question.
     await o.dispatcher.handle(action('intruder') as never);
     expect(run.consumed).toHaveLength(1);
-    await o.dispatcher.handle(action('owner') as never);
+    await o.dispatcher.handle(action('collaborator') as never);
     await until(() => expect(run.consumed).toHaveLength(2));
     expect(run.consumed[1]!.text).toContain('希望用什么风格？\n回答：详细');
-    await o.dispatcher.handle(action('owner') as never);
+    await o.dispatcher.handle(action('collaborator') as never);
     expect(run.consumed).toHaveLength(2);
+    run.emit({ type: 'user_input_async', threadId: 'host', turnId: 'turn-2', itemId: 'follow-up-question',
+      questions: [{ id: 'next', header: 'Next', question: '还要继续吗？', isOther: true, isSecret: false, options: null }],
+    }, 1);
+    await until(() => expect(fake.questionSend.mock.calls.some(args =>
+      JSON.stringify(args[2]).includes('<at id=collaborator></at>'))).toBe(true));
     run.turns[1]!.resolve();
   });
 
