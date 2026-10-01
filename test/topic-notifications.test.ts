@@ -10,7 +10,8 @@ function fixture() {
     get: async ({ path }: any) => ({ code: 0, data: { items: [{ thread_id: 'omt_topic',
       ...(path.message_id === 'om_root' ? { sender: { id: 'ou_root', sender_type: 'user' } } : { root_id: 'om_root' }),
     }] } }),
-    list: async ({ params }: any) => ({ code: 0, data: params.page_token ? {
+    list: async ({ params }: any) => ({ code: params.container_id === 'omt_topic' && params.container_id_type === 'thread' ? 0 : 400,
+      data: params.page_token ? {
       items: people.map(id => ({ sender: { id, sender_type: 'user' } })), has_more: false,
     } : { items: [{ sender: { id: 'cli_bot', sender_type: 'app' } },
       { sender: { id: 'ou_A', sender_type: 'user' } }, { sender: { id: 'system', sender_type: 'system' } }],
