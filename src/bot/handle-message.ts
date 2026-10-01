@@ -2278,6 +2278,13 @@ export function createOrchestrator(
       replyTo: scope.replyToMessageId,
       replyInThread: scope.inThread,
     }),
+    canSubmit: async (scope, openId) => {
+      const project = await getProjectByChatId(scope.chatId);
+      if (!isChatAllowed(cfg, scope.chatId) || !isUserAllowedInProject(cfg, project, openId)) return false;
+      if (!scope.sessionKey) return !turnPerm(project, openId).roleSuffix;
+      const baseKey = scope.sessionKey.replace(/#(admin|guest)$/, '');
+      return turnSession(baseKey, project, openId).sessionKey === scope.sessionKey;
+    },
     onError: (err, phase) => log.fail('card', err, { phase: `user-input-${phase}` }),
   });
   userInputs.register(dispatcher);
@@ -4158,16 +4165,19 @@ export function createOrchestrator(
     requesterOpenId: string | undefined,
   ): Promise<void> {
     if (!sessionKey || !requesterOpenId) throw new Error('async user input has no bound session or requester');
-    const request = createAsyncUserInputRequest(event, async (text) => {
+    const request = createAsyncUserInputRequest(event, async (text, responderId) => {
+      const answererOpenId = responderId ?? requesterOpenId;
       if (shuttingDown) throw new Error('bridge is shutting down');
       const project = await getProjectByChatId(opts.chatId);
       const rec = await getSession(sessionKey);
       if (!rec || rec.sessionId !== event.threadId || rec.chatId !== opts.chatId) {
         throw new Error('the question no longer belongs to the current session');
       }
-      if (!isChatAllowed(cfg, opts.chatId) || !isUserAllowedInProject(cfg, project, requesterOpenId)) {
-        throw new Error('the question requester no longer has access');
+      if (!isChatAllowed(cfg, opts.chatId) || !isUserAllowedInProject(cfg, project, answererOpenId)) {
+        throw new Error('the question responder no longer has access');
       }
+      const continuation = turnSession(sessionKey.replace(/#(admin|guest)$/, ''), project, answererOpenId);
+      if (continuation.sessionKey !== sessionKey) throw new Error('the question belongs to a different permission tier');
       const current = active.get(sessionKey);
       if (current?.intakeCancelled) throw new Error('the conversation has been stopped');
       if (current?.isGoal) {
@@ -4178,7 +4188,7 @@ export function createOrchestrator(
         return;
       }
       const synthetic: NormalizedMessage = {
-        messageId: replyTo, chatId: opts.chatId, chatType: 'group', senderId: requesterOpenId,
+        messageId: replyTo, chatId: opts.chatId, chatType: 'group', senderId: answererOpenId,
         content: text, rawContentType: 'text', resources: [], mentions: [],
         mentionAll: false, mentionedBot: true,
         threadId: opts.flat ? undefined : sessionKey.replace(/#(admin|guest)$/, ''),
@@ -4186,12 +4196,12 @@ export function createOrchestrator(
       };
       // The same reservation/queue path as a real user message: no detached
       // turn/start that would bypass concurrency, permissions or run cards.
-      startReservedRun(synthetic, text, sessionKey, Boolean(opts.flat), project,
-        turnPerm(project, requesterOpenId), undefined, { text }, '回答提问');
+      startReservedRun(synthetic, text, continuation.sessionKey, Boolean(opts.flat), project,
+        continuation, undefined, { text }, '回答提问');
       log.info('agent', 'async-user-input-submitted', { sessionId: event.threadId, itemId: event.itemId });
     });
     await userInputs.open(request, {
-      chatId: opts.chatId, replyToMessageId: replyTo, inThread: !opts.flat, requesterOpenId,
+      chatId: opts.chatId, replyToMessageId: replyTo, inThread: !opts.flat, requesterOpenId, sessionKey,
     });
     log.info('card', 'async-user-input-opened', { sessionId: event.threadId, itemId: event.itemId });
   }
@@ -4701,6 +4711,7 @@ export function createOrchestrator(
               replyToMessageId: cardMsgId,
               inThread: !opts.flat,
               requesterOpenId: state.requesterOpenId,
+              sessionKey: topicThreadId ?? activeKey,
             }).catch((err) => log.fail('card', err, { phase: 'user-input-open' }));
             continue;
           }
@@ -5432,6 +5443,7 @@ export function createOrchestrator(
             replyToMessageId: cur?.cardMsgId ?? replyTo,
             inThread: !opts.flat,
             requesterOpenId: state.requesterOpenId,
+            sessionKey: topicThreadId ?? activeKey,
           }).catch((err) => log.fail('card', err, { phase: 'user-input-open' }));
           continue;
         }

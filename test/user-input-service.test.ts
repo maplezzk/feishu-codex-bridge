@@ -110,6 +110,7 @@ function setup(overrides: {
   update?: (messageId: string, card: object) => Promise<boolean>;
   notify?: (scope: UserInputScope, text: string) => Promise<unknown>;
   respondFailure?: Error;
+  canSubmit?: (scope: UserInputScope, openId: string) => boolean | Promise<boolean>;
 } = {}) {
   const sent: { scope: UserInputScope; card: object }[] = [];
   const updates: { messageId: string; card: object }[] = [];
@@ -134,6 +135,7 @@ function setup(overrides: {
     send,
     update,
     notify,
+    canSubmit: overrides.canSubmit,
     onError: (error, phase) => errors.push({ error, phase }),
   });
   const dispatcher = new CardDispatcher({} as never, {} as never);
@@ -176,20 +178,20 @@ describe('Codex user-input service', () => {
     expect(JSON.stringify(card)).toContain(USER_INPUT_ACTION);
 
     await click(t, { [questionField(0)]: '1', [customField(0)]: 'my own mode' });
-    expect(t.harness.respond).toHaveBeenCalledWith({ mode: { answers: ['my own mode'] } });
+    expect(t.harness.respond).toHaveBeenCalledWith({ mode: { answers: ['my own mode'] } }, t.scope.requesterOpenId);
     await vi.advanceTimersByTimeAsync(0);
     expect(JSON.stringify(t.updates.at(-1)?.card)).toContain('my own mode');
   });
 
-  it('rejects callbacks from another user, chat, or message without resolving the request', async () => {
-    const t = setup();
+  it('rejects callbacks from a user without access, another chat, or another card', async () => {
+    const t = setup({ canSubmit: (_scope, openId) => openId !== 'intruder' });
     await t.service.open(t.harness.request, t.scope);
     await click(t, { [questionField(0)]: '0' }, { openId: 'intruder' });
     await click(t, { [questionField(0)]: '0' }, { chatId: 'other-chat' });
     await click(t, { [questionField(0)]: '0' }, { messageId: 'other-message' });
     expect(t.harness.respond).not.toHaveBeenCalled();
     expect(t.harness.reject).not.toHaveBeenCalled();
-    expect(t.notices.map((notice) => notice.text).join('\n')).toMatch(/只接受|所属会话|当前提问卡/);
+    expect(t.notices.map((notice) => notice.text).join('\n')).toMatch(/权限|所属会话|当前提问卡/);
   });
 
   it('notifies and refreshes the pending card for empty or invalid answers, then accepts a retry', async () => {
@@ -199,8 +201,9 @@ describe('Codex user-input service', () => {
     await click(t, { [questionField(0)]: '999' });
     expect(t.harness.respond).not.toHaveBeenCalled();
     expect(t.updates.length).toBeGreaterThanOrEqual(2);
+    expect(t.updates.every(update => !JSON.stringify(update.card).includes('<at id='))).toBe(true);
     await click(t, { [questionField(0)]: '0' });
-    expect(t.harness.respond).toHaveBeenCalledWith({ mode: { answers: ['Fast'] } });
+    expect(t.harness.respond).toHaveBeenCalledWith({ mode: { answers: ['Fast'] } }, t.scope.requesterOpenId);
   });
 
   it('rejects a selected-option array containing an invalid member without dropping it', async () => {
@@ -273,7 +276,7 @@ describe('Codex user-input service', () => {
     await click(t, {});
     expect(t.harness.respond).not.toHaveBeenCalled();
     await click(t, { [customField(0)]: 'typed answer' });
-    expect(t.harness.respond).toHaveBeenCalledWith({ mode: { answers: ['typed answer'] } });
+    expect(t.harness.respond).toHaveBeenCalledWith({ mode: { answers: ['typed answer'] } }, t.scope.requesterOpenId);
   });
 
   it('turns an external resolution into an inactive card, and late clicks only notify', async () => {

@@ -58,15 +58,22 @@ function nodes(value: unknown): Record<string, any>[] {
 }
 
 describe('Codex question round trip through Feishu forms', () => {
-  it('answers the original string RPC id, rejects a different user, and continues the same turn once', async () => {
+  it('mentions the requester, accepts a permitted collaborator, and continues the original turn once', async () => {
     wire.writes.length = 0;
     const thread = await new CodexAppServerBackend().startThread({ cwd: process.cwd(), mode: 'full' });
     const channel = {} as LarkChannel;
     const dispatcher = new CardDispatcher(channel, {} as AppConfig);
     const send = vi.fn(async (_scope: unknown, _card: object) => ({ messageId: 'question-message' }));
-    const update = vi.fn(async () => true);
+    const update = vi.fn(async (_messageId: string, _card: object) => true);
     const notify = vi.fn(async () => undefined);
-    const service = createUserInputService({ send, update, notify });
+    let accessUnavailable = true;
+    const service = createUserInputService({ send, update, notify, canSubmit: async (_scope, openId) => {
+      if (openId === 'collaborator-e2e' && accessUnavailable) {
+        accessUnavailable = false;
+        throw new Error('access unavailable');
+      }
+      return openId !== 'no-access';
+    } });
     service.register(dispatcher);
     const events: string[] = [];
     const run = thread.runStreamed({ text: 'Ask me two questions' });
@@ -81,6 +88,7 @@ describe('Codex question round trip through Feishu forms', () => {
     try {
       await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
       const cardNodes = nodes(send.mock.calls[0]![1]);
+      expect(cardNodes.filter(node => node.tag === 'markdown').map(node => node.content).join('\n')).toContain('<at id=owner-e2e></at>');
       const callback = cardNodes.find((node) => node.a === 'codex.question.submit');
       const select = cardNodes.find((node) => node.tag === 'select_static')!;
       const input = cardNodes.find((node) => node.tag === 'input')!;
@@ -90,17 +98,24 @@ describe('Codex question round trip through Feishu forms', () => {
         chatId: 'chat-e2e', messageId: 'question-message', operator: { openId },
         action: { value: callback, tag: 'button' }, raw: { action: { form_value: formValue } },
       }) as unknown as CardActionEvent;
-      await dispatcher.handle(action('different-user'));
+      await dispatcher.handle(action('collaborator-e2e'));
+      expect(notify.mock.calls.some(args => JSON.stringify(args).includes('暂时无法验证你的权限'))).toBe(true);
+      expect(nodes(update.mock.calls.at(-1)?.[1]).some(node => node.tag === 'form')).toBe(true);
+      await dispatcher.handle(action('no-access'));
       expect(wire.writes.filter((message) => message.id === 'ask-42')).toEqual([]);
-      await dispatcher.handle(action('owner-e2e'));
+      await Promise.all([dispatcher.handle(action('collaborator-e2e')), dispatcher.handle(action('owner-e2e'))]);
       await consume;
       expect(wire.writes.filter((message) => message.id === 'ask-42')).toEqual([
         { jsonrpc: '2.0', id: 'ask-42', result: { answers: { color: { answers: ['Blue'] }, style: { answers: ['minimal'] } } } },
       ]);
       expect(events).toContain('text');
       expect(events.at(-1)).toBe('done');
-      await dispatcher.handle(action('owner-e2e'));
+      await dispatcher.handle(action('collaborator-e2e'));
       expect(wire.writes.filter((message) => message.id === 'ask-42')).toHaveLength(1);
+      expect(JSON.stringify(update.mock.calls.at(-1)?.[1])).toContain('已收到回答');
+      const resolvedText = nodes(update.mock.calls.at(-1)?.[1]).filter(node => node.tag === 'markdown').map(node => node.content);
+      expect(resolvedText).toEqual(['✅ 已收到回答，提问已关闭。', 'Choose a color', '回答：Blue', 'Describe the style', '回答：minimal']);
+      expect(update.mock.calls.every(args => !JSON.stringify(args).includes('<at id='))).toBe(true);
       expect(update).toHaveBeenCalled();
       expect(notify).toHaveBeenCalled();
     } finally {

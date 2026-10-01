@@ -130,7 +130,8 @@ export interface AgentUserInputRequest {
   /** Async questions remain answerable after the producing turn finishes. */
   persistsAfterTurn?: boolean;
   isPending(): boolean;
-  respond(answers: Record<string, { answers: string[] }>): Promise<void>;
+  /** Responder identity is local context for async continuation, not RPC data. */
+  respond(answers: Record<string, { answers: string[] }>, responderId?: string): Promise<void>;
   reject(reason: string): Promise<void>;
   onResolved(listener: (reason: string) => void): () => void;
 }
